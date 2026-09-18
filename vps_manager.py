@@ -239,34 +239,27 @@ def _extract_sshx_link(text: str) -> str:
 
 
 def start_sshx(name: str):
-    """Ensure SSHX is installed, start it detached, return the share link."""
-    try:
-        c = client().containers.get(name)
-    except docker.errors.NotFound:
-        return ""
-
-    # Install SSHX if it's not there yet
-    code, _ = _exec(name, "command -v sshx")
+    """Ensure SSHX is installed, start it detached. Returns (link, error)."""
+    # Install SSHX if missing
+    code, _, _ = run(f"docker exec {name} sh -c 'command -v sshx'")
     if code != 0:
-        _exec(name, "apt-get update -y && apt-get install -y curl ca-certificates procps tar bsdutils")
-        _exec(name, "curl -sSf https://sshx.io/get | sh")
-        code, _ = _exec(name, "command -v sshx")
+        run(f"docker exec {name} sh -c 'apt-get update -y && apt-get install -y curl ca-certificates procps tar bsdutils'", timeout=300)
+        run(f"docker exec {name} sh -c 'curl -sSf https://sshx.io/get | sh'", timeout=300)
+        code, _, _ = run(f"docker exec {name} sh -c 'command -v sshx'")
         if code != 0:
-            return ""
+            return "", "sshx could not be installed"
 
-    # Start SSHX detached (no TTY needed) so the session stays alive
-    try:
-        c.exec_run("sshx > /tmp/sshx.log 2>&1", detach=True)
-    except Exception:
-        return ""
+    # Start SSHX detached so the session stays alive; log to a file
+    run(f"docker exec -d {name} sh -c 'sshx > /tmp/sshx.log 2>&1'")
 
     # Poll the log for the share link
     for _ in range(10):
         time.sleep(1)
-        code, out = _exec(name, "cat /tmp/sshx.log 2>/dev/null")
+        code, out, _ = run(f"docker exec {name} cat /tmp/sshx.log")
         if code == 0:
             link = _extract_sshx_link(out)
             if link:
-                return link
+                return link, ""
 
-    return ""
+    code, out, _ = run(f"docker exec {name} sh -c 'tail -5 /tmp/sshx.log 2>/dev/null'")
+    return "", (out if code == 0 and out else "no output from sshx")

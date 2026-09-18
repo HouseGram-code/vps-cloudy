@@ -181,7 +181,7 @@ class ManageView(discord.ui.View):
     @discord.ui.button(label="Console (SSHX)", emoji="💻", style=discord.ButtonStyle.gray)
     async def console(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        link = await asyncio.to_thread(vm.start_sshx, self.name)
+        link, err = await asyncio.to_thread(vm.start_sshx, self.name)
         if link:
             view = discord.ui.View()
             view.add_item(discord.ui.Button(label="Open Console", url=link))
@@ -192,8 +192,8 @@ class ManageView(discord.ui.View):
             )
         else:
             await interaction.followup.send(
-                "⚠️ Could not start SSHX. Make sure SSHX is installed in the container, or use:\n"
-                f"`docker exec -it {self.name} bash`",
+                f"⚠️ Could not start SSHX.\n```{err[:1000]}```\n"
+                f"Manual access: `docker exec -it {self.name} bash`",
                 ephemeral=True,
             )
 
