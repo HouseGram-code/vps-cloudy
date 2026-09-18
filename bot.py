@@ -55,7 +55,6 @@ async def build_manage_embed(name: str, number: int) -> discord.Embed:
     uptime = await asyncio.to_thread(vm.get_uptime, name)
     load = await asyncio.to_thread(vm.get_load, name)
     cpu, mem_used, mem_total, mem_pct = await asyncio.to_thread(vm.get_stats, name)
-    disk_used, disk_size, disk_pct = await asyncio.to_thread(vm.get_disk, name)
 
     ram = info.get("ram") or config.DEFAULT_RAM
     cpu_n = info.get("cpu") or str(config.DEFAULT_CPU)
@@ -101,7 +100,7 @@ async def build_manage_embed(name: str, number: int) -> discord.Embed:
         value=(
             f"**CPU Usage:** {cpu:.1f}%\n"
             f"**Memory:** {mem_used}/{mem_total} MB ({mem_pct}%)\n"
-            f"**Disk:** {disk_used}/{disk_size} ({disk_pct}%)"
+            f"**Disk:** unknown / {disk}"
         ),
         inline=False,
     )
