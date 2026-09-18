@@ -72,7 +72,7 @@ def _exec(name: str, cmd: str):
         return 1, str(e)
 
 
-def create(name: str, os_image: str, ram: str, cpu: int, disk: str):
+def create(name: str, os_image: str, ram: str, cpu: int, disk: str, owner: str = ""):
     """Create and start a Docker container with the requested resource limits."""
     labels = {
         LABEL: "true",
@@ -80,6 +80,7 @@ def create(name: str, os_image: str, ram: str, cpu: int, disk: str):
         "cloudy.ram": ram,
         "cloudy.cpu": str(cpu),
         "cloudy.disk": disk,
+        "cloudy.owner": str(owner),
         "cloudy.expires": time.strftime(
             "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + LIFETIME_DAYS * 86400)
         ),
@@ -166,21 +167,45 @@ def get_load(name: str):
     return ["-", "-", "-"]
 
 
-def get_memory(name: str):
-    """Return (used_mb, total_mb, percent)."""
-    code, out = _exec(name, "free -m")
-    if code == 0:
-        for line in out.splitlines():
-            if line.startswith("Mem:"):
-                parts = line.split()
-                try:
-                    total = int(parts[1])
-                    used = int(parts[2])
-                    pct = round(used / total * 100, 1) if total else 0.0
-                    return used, total, pct
-                except (ValueError, IndexError):
-                    break
-    return 0, 0, 0.0
+def get_stats(name: str):
+    """Real container usage from Docker stats: (cpu_percent, mem_used_mb, mem_limit_mb, mem_percent)."""
+    try:
+        c = client().containers.get(name)
+        s1 = c.stats(stream=False)
+    except Exception:
+        return 0.0, 0, 0, 0.0
+
+    time.sleep(1)
+
+    try:
+        s2 = c.stats(stream=False)
+    except Exception:
+        s2 = s1
+
+    ms = s2.get("memory_stats", {})
+    usage = ms.get("usage", 0) or 0
+    limit = ms.get("limit", 0) or 0
+    mem_used_mb = round(usage / 1048576)
+    mem_limit_mb = round(limit / 1048576)
+    mem_percent = round(usage / limit * 100, 1) if limit else 0.0
+
+    cpu_percent = 0.0
+    try:
+        cs1 = s1.get("cpu_stats", {})
+        cs2 = s2.get("cpu_stats", {})
+        t1 = cs1.get("cpu_usage", {}).get("total_usage", 0) or 0
+        t2 = cs2.get("cpu_usage", {}).get("total_usage", 0) or 0
+        sy1 = cs1.get("system_cpu_usage", 0) or 0
+        sy2 = cs2.get("system_cpu_usage", 0) or 0
+        online = cs2.get("online_cpus") or len(cs2.get("cpu_usage", {}).get("percpu_usage", [0])) or 1
+        cd = t2 - t1
+        sd = sy2 - sy1
+        if cd > 0 and sd > 0:
+            cpu_percent = round((cd / sd) * online * 100.0, 1)
+    except Exception:
+        cpu_percent = 0.0
+
+    return cpu_percent, mem_used_mb, mem_limit_mb, mem_percent
 
 
 def get_disk(name: str):
@@ -195,16 +220,15 @@ def get_disk(name: str):
     return "-", "-", "-"
 
 
-def get_cpu_usage(name: str):
-    """Return CPU usage percent (host CPU as seen from the container)."""
-    code, out = _exec(name, "top -bn1 | grep -m1 Cpu")
-    if code == 0 and out:
-        try:
-            after = out.split(":", 1)[1].strip()
-            return float(after.split(",")[0].split()[0])
-        except (IndexError, ValueError):
-            pass
-    return 0.0
+def owner_has_vps(owner_id) -> bool:
+    """True if the user already owns a VPS container (one VPS per user)."""
+    try:
+        for c in _vps(all_=True):
+            if str((c.labels or {}).get("cloudy.owner")) == str(owner_id):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def start_sshx(name: str):

@@ -54,9 +54,8 @@ async def build_manage_embed(name: str, number: int) -> discord.Embed:
     st = await asyncio.to_thread(vm.state, name)
     uptime = await asyncio.to_thread(vm.get_uptime, name)
     load = await asyncio.to_thread(vm.get_load, name)
-    mem_used, mem_total, mem_pct = await asyncio.to_thread(vm.get_memory, name)
+    cpu, mem_used, mem_total, mem_pct = await asyncio.to_thread(vm.get_stats, name)
     disk_used, disk_size, disk_pct = await asyncio.to_thread(vm.get_disk, name)
-    cpu = await asyncio.to_thread(vm.get_cpu_usage, name)
 
     ram = info.get("ram") or config.DEFAULT_RAM
     cpu_n = info.get("cpu") or str(config.DEFAULT_CPU)
@@ -261,6 +260,7 @@ async def run_deploy(msg: discord.Message, name: str, os_image: str, user: disco
         config.DEFAULT_RAM,
         config.DEFAULT_CPU,
         config.DEFAULT_DISK,
+        str(user.id),
     )
 
     if not ok:
@@ -315,6 +315,10 @@ async def help_cmd(ctx):
 
 @bot.command(name="deploy")
 async def deploy(ctx):
+    if vm.owner_has_vps(ctx.author.id):
+        await ctx.send(f"❌ You already have a VPS. Use `{config.PREFIX}manage` to control it.")
+        return
+
     embed = discord.Embed(
         title="🚀 VPS Deployment",
         description=(
@@ -357,77 +361,77 @@ async def manage(ctx, name: str = None):
 
 @bot.command(name="status", aliases=["ping"])
 async def status(ctx):
-    # Discord gateway latency
-    gateway_ms = round(bot.latency * 1000, 1)
+    try:
+        # Discord gateway latency
+        gateway_ms = round(bot.latency * 1000, 1)
 
-    # Network ping to 1.1.1.1 (fallback 8.8.8.8)
-    ping_ms = await asyncio.to_thread(measure_ping)
+        # Network ping (TCP to Cloudflare/Google DNS)
+        ping_ms = await asyncio.to_thread(measure_ping)
 
-    # Host load average
-    load1, load5, load15 = await asyncio.to_thread(get_host_load)
-    cores = os.cpu_count() or 1
+        # Host load average
+        load1, load5, load15 = await asyncio.to_thread(get_host_load)
+        cores = os.cpu_count() or 1
 
-    # Decide color
-    if ping_ms is None or load1 >= cores * 1.2:
-        color = RED
-        health = "🔴 Degraded"
-    elif load1 >= cores * 0.7 or (ping_ms and ping_ms > 150):
-        color = YELLOW
-        health = "🟡 High load"
-    else:
-        color = GREEN
-        health = "🟢 Healthy"
+        if ping_ms is None or load1 >= cores * 1.2:
+            color = RED
+            health = "🔴 Degraded"
+        elif load1 >= cores * 0.7 or (ping_ms and ping_ms > 150):
+            color = YELLOW
+            health = "🟡 High load"
+        else:
+            color = GREEN
+            health = "🟢 Healthy"
 
-    embed = discord.Embed(
-        title="📡 Server Status",
-        description=f"Node: `{config.NODE_NAME}`",
-        color=color,
-    )
-    embed.add_field(name="Health", value=health, inline=False)
-    embed.add_field(
-        name="Ping",
-        value=(
-            f"**Network:** {f'{ping_ms} ms' if ping_ms is not None else 'timeout'}\n"
-            f"**Discord latency:** {gateway_ms} ms"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Load Average",
-        value=f"`{load1} {load5} {load15}`  (CPU cores: {cores})",
-        inline=False,
-    )
-    embed.add_field(
-        name="Legend",
-        value="🟢 normal • 🟡 high load • 🔴 failure",
-        inline=False,
-    )
-    embed.set_footer(text=f"Cloudy VPS Bot v{config.BOT_VERSION}")
-    await ctx.send(embed=embed)
+        embed = discord.Embed(
+            title="📡 Server Status",
+            description=f"Node: `{config.NODE_NAME}`",
+            color=color,
+        )
+        embed.add_field(name="Health", value=health, inline=False)
+        embed.add_field(
+            name="Ping",
+            value=(
+                f"**Network:** {f'{ping_ms} ms' if ping_ms is not None else 'timeout'}\n"
+                f"**Discord latency:** {gateway_ms} ms"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Load Average",
+            value=f"`{load1:.2f} {load5:.2f} {load15:.2f}`  (CPU cores: {cores})",
+            inline=False,
+        )
+        embed.add_field(
+            name="Legend",
+            value="🟢 normal • 🟡 high load • 🔴 failure",
+            inline=False,
+        )
+        embed.set_footer(text=f"Cloudy VPS Bot v{config.BOT_VERSION}")
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"❌ Status check failed: {e}")
 
 
-def measure_ping() -> int | None:
-    import subprocess
+def measure_ping() -> float | None:
+    import socket
 
-    for host in ("1.1.1.1", "8.8.8.8"):
-        code, out, _ = vm.run(f"ping -c 1 -W 2 {host}")
-        if code == 0:
-            # "time=12.3 ms"
-            for token in out.split():
-                if token.startswith("time="):
-                    try:
-                        return round(float(token[5:].rstrip("ms")), 1)
-                    except ValueError:
-                        pass
+    for host, port in (("1.1.1.1", 53), ("8.8.8.8", 53)):
+        start = time.monotonic()
+        try:
+            s = socket.create_connection((host, port), timeout=2)
+            s.close()
+            return round((time.monotonic() - start) * 1000, 1)
+        except OSError:
+            continue
     return None
 
 
 def get_host_load():
     try:
         with open("/proc/loadavg") as f:
-            return f.read().split()[:3]
-    except OSError:
-        return ["-", "-", "-"]
+            return [float(x) for x in f.read().split()[:3]]
+    except (OSError, ValueError):
+        return [0.0, 0.0, 0.0]
 
 
 if __name__ == "__main__":
