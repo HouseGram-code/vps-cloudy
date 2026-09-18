@@ -207,12 +207,15 @@ class ManageView(discord.ui.View):
 
 class ConfirmDeleteView(discord.ui.View):
     def __init__(self, name: str):
-        super().__init__(timeout=60)
+        super().__init__(timeout=None)
         self.name = name
 
     @discord.ui.button(label="Yes, delete", emoji="🗑️", style=discord.ButtonStyle.danger)
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        try:
+            await interaction.response.defer()
+        except Exception:
+            return
         ok, err = await asyncio.to_thread(vm.delete, self.name)
         for child in self.children:
             child.disabled = True
@@ -224,9 +227,11 @@ class ConfirmDeleteView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(view=self)
+        try:
+            await interaction.response.edit_message(content="Cancelled.", view=None)
+        except Exception:
+            pass
+        self.stop()
 
 
 async def run_deploy(msg: discord.Message, name: str, os_image: str, user: discord.User):

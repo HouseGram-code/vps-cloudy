@@ -243,11 +243,12 @@ def start_sshx(name: str):
     # Install SSHX if missing
     code, _, _ = run(f"docker exec {name} sh -c 'command -v sshx'")
     if code != 0:
-        run(f"docker exec {name} sh -c 'apt-get update -y && apt-get install -y curl ca-certificates procps tar bsdutils'", timeout=300)
-        run(f"docker exec {name} sh -c 'curl -sSf https://sshx.io/get | sh'", timeout=300)
+        c1, o1, e1 = run(f"docker exec {name} sh -c 'apt-get update -y && apt-get install -y curl ca-certificates procps tar'", timeout=300)
+        c2, o2, e2 = run(f"docker exec {name} sh -c 'curl -sSf https://sshx.io/get | sh'", timeout=300)
         code, _, _ = run(f"docker exec {name} sh -c 'command -v sshx'")
         if code != 0:
-            return "", "sshx could not be installed"
+            detail = "\n".join(x for x in (e1, o1, e2, o2) if x)
+            return "", f"sshx install failed:\n{detail[:800]}"
 
     # Start SSHX detached so the session stays alive; log to a file
     run(f"docker exec -d {name} sh -c 'sshx > /tmp/sshx.log 2>&1'")
