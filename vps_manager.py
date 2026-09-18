@@ -5,6 +5,7 @@ through /var/run/docker.sock: run the bot natively, or mount the socket if the
 bot itself runs inside Docker (see docker-compose.yml).
 """
 
+import re
 import subprocess
 import time
 
@@ -232,11 +233,8 @@ def owner_has_vps(owner_id) -> bool:
 
 
 def _extract_sshx_link(text: str) -> str:
-    for line in text.splitlines():
-        idx = line.find("https://sshx.io/")
-        if idx != -1:
-            return line[idx:].split()[0].rstrip(".,;")
-    return ""
+    m = re.search(r"https://sshx\.io/[^\s\x1b]+", text)
+    return m.group(0) if m else ""
 
 
 def start_sshx(name: str):
@@ -249,20 +247,20 @@ def start_sshx(name: str):
     # Install SSHX if it's not there yet
     code, _ = _exec(name, "command -v sshx")
     if code != 0:
-        _exec(name, "apt-get update -y && apt-get install -y curl ca-certificates procps tar")
+        _exec(name, "apt-get update -y && apt-get install -y curl ca-certificates procps tar bsdutils")
         _exec(name, "curl -sSf https://sshx.io/get | sh")
         code, _ = _exec(name, "command -v sshx")
         if code != 0:
             return ""
 
-    # Start SSHX detached so the session stays alive; capture output to a file
+    # Start SSHX detached (with a PTY) so the session stays alive
     try:
-        c.exec_run("sshx > /tmp/sshx.log 2>&1", detach=True)
+        c.exec_run("sshx > /tmp/sshx.log 2>&1", detach=True, tty=True)
     except Exception:
         return ""
 
     # Poll the log for the share link
-    for _ in range(8):
+    for _ in range(10):
         time.sleep(1)
         code, out = _exec(name, "cat /tmp/sshx.log 2>/dev/null")
         if code == 0:

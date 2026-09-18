@@ -216,11 +216,11 @@ class ConfirmDeleteView(discord.ui.View):
         ok, err = await asyncio.to_thread(vm.delete, self.name)
         for child in self.children:
             child.disabled = True
-        await interaction.message.edit(view=self)
         if ok:
-            await interaction.followup.send(f"🗑️ VPS `{self.name}` deleted.", ephemeral=True)
+            await interaction.edit_original_response(content=f"🗑️ VPS `{self.name}` deleted.", view=None)
         else:
-            await interaction.followup.send(f"❌ Delete failed: {err}", ephemeral=True)
+            await interaction.edit_original_response(content=f"❌ Delete failed: {err}", view=None)
+        self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
