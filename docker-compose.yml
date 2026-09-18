@@ -1,0 +1,15 @@
+services:
+  discord-vps-bot:
+    build: .
+    container_name: discord-vps-bot
+    restart: unless-stopped
+    env_file: .env
+    # The bot needs to reach the LXD daemon on the host to manage LXC containers.
+    privileged: true
+    network_mode: host
+    volumes:
+      # Deb-based LXD socket
+      - /var/lib/lxd:/var/lib/lxd
+      - /run/lxd:/run/lxd
+      # Snap-based LXD socket
+      - /var/snap/lxd/common/lxd:/var/snap/lxd/common/lxd
