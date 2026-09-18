@@ -254,9 +254,9 @@ def start_sshx(name: str):
         if code != 0:
             return ""
 
-    # Start SSHX detached (with a PTY) so the session stays alive
+    # Start SSHX detached (no TTY needed) so the session stays alive
     try:
-        c.exec_run("sshx > /tmp/sshx.log 2>&1", detach=True, tty=True)
+        c.exec_run("sshx > /tmp/sshx.log 2>&1", detach=True)
     except Exception:
         return ""
 
