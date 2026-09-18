@@ -231,10 +231,43 @@ def owner_has_vps(owner_id) -> bool:
     return False
 
 
+def _extract_sshx_link(text: str) -> str:
+    for line in text.splitlines():
+        idx = line.find("https://sshx.io/")
+        if idx != -1:
+            return line[idx:].split()[0].rstrip(".,;")
+    return ""
+
+
 def start_sshx(name: str):
-    """Start an SSHX session in the container and return the share link."""
-    code, out = _exec(name, "sshx 2>&1 | head -20")
-    for token in out.split():
-        if token.startswith("https://sshx.io/"):
-            return token.rstrip(".,;")
+    """Ensure SSHX is installed, start it detached, return the share link."""
+    try:
+        c = client().containers.get(name)
+    except docker.errors.NotFound:
+        return ""
+
+    # Install SSHX if it's not there yet
+    code, _ = _exec(name, "command -v sshx")
+    if code != 0:
+        _exec(name, "apt-get update -y && apt-get install -y curl ca-certificates procps tar")
+        _exec(name, "curl -sSf https://sshx.io/get | sh")
+        code, _ = _exec(name, "command -v sshx")
+        if code != 0:
+            return ""
+
+    # Start SSHX detached so the session stays alive; capture output to a file
+    try:
+        c.exec_run("sshx > /tmp/sshx.log 2>&1", detach=True)
+    except Exception:
+        return ""
+
+    # Poll the log for the share link
+    for _ in range(8):
+        time.sleep(1)
+        code, out = _exec(name, "cat /tmp/sshx.log 2>/dev/null")
+        if code == 0:
+            link = _extract_sshx_link(out)
+            if link:
+                return link
+
     return ""
