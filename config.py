@@ -20,5 +20,8 @@ OWNER_PREFIX = os.getenv("OWNER_PREFIX", "tbmen12")
 # LXC socket path (empty = let lxc client auto-detect)
 LXD_SOCKET = os.getenv("LXD_SOCKET", "")
 
+# Which container manager CLI to use: "lxc" (LXD) or "incus"
+LXC_BIN = os.getenv("LXC_BIN", "lxc")
+
 # How many days a new VPS lives before it expires
 LIFETIME_DAYS = int(os.getenv("LIFETIME_DAYS", "30"))
