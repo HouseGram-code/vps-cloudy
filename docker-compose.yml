@@ -4,17 +4,6 @@ services:
     container_name: discord-vps-bot
     restart: unless-stopped
     env_file: .env
-    # The bot needs to reach the LXD daemon on the host to manage LXC containers.
-    privileged: true
-    network_mode: host
+    # The bot manages Docker containers ("VPS"), so it needs the Docker socket.
     volumes:
-      # Deb-based LXD socket
-      - /var/lib/lxd:/var/lib/lxd
-      - /run/lxd:/run/lxd
-      # Snap-based LXD socket
-      - /var/snap/lxd/common/lxd:/var/snap/lxd/common/lxd
-      # Host's `lxc` (LXD) client binary — a static Go binary, no install needed.
-      # Snap LXD (Ubuntu 24.04 default):
-      - /snap/lxd/current/bin/lxc:/usr/local/bin/lxc:ro
-      # Deb LXD — if you installed LXD via apt, comment the line above and use:
-      # - /usr/bin/lxc:/usr/local/bin/lxc:ro
+      - /var/run/docker.sock:/var/run/docker.sock

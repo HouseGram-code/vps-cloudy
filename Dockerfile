@@ -2,11 +2,9 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1
 
-# Lightweight tools only: ping for !status, curl + ca-cert for SSHX setup.
-# The `lxc` client is mounted from the host in docker-compose.yml.
+# iputils-ping for the !status ping check, ca-certificates for HTTPS (Discord API)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        iputils-ping ca-certificates curl && \
+    apt-get install -y --no-install-recommends iputils-ping ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

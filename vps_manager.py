@@ -1,131 +1,166 @@
-"""Thin wrapper around the LXD/LXC CLI used by the Discord bot.
+"""Docker backend — each "VPS" is a Docker container with resource limits.
 
-All operations go through `lxc` (LXD) or `incus` (drop-in LXD fork).
-Set LXC_BIN=incus in .env if you use Incus instead of LXD.
+Uses the Docker SDK (pip install docker). The bot talks to the Docker daemon
+through /var/run/docker.sock: run the bot natively, or mount the socket if the
+bot itself runs inside Docker (see docker-compose.yml).
 """
 
-import os
 import subprocess
 import time
 
-from config import LXC_BIN, LXD_SOCKET, LIFETIME_DAYS
+import docker
 
-BIN = LXC_BIN  # "lxc" or "incus"
+from config import LIFETIME_DAYS
 
+LABEL = "cloudy.vps"  # label that marks our managed VPS containers
 
-def _env() -> dict:
-    env = os.environ.copy()
-    if LXD_SOCKET:
-        env["LXD_SOCKET"] = LXD_SOCKET
-        env["INCUS_SOCKET"] = LXD_SOCKET
-    return env
+_client = None
 
 
-def run(cmd: str, timeout: int = 120):
-    """Run a shell command, return (returncode, stdout, stderr)."""
+def client():
+    global _client
+    if _client is None:
+        _client = docker.from_env()
+    return _client
+
+
+# --- host-level shell helper (used by !status ping) ---
+def run(cmd: str, timeout: int = 60):
     try:
-        p = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_env(),
-        )
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
     except subprocess.TimeoutExpired:
         return 1, "", "command timed out"
 
 
+# --- container operations ---
+def _vps(all_=False):
+    return client().containers.list(all=all_, filters={"label": f"{LABEL}=true"})
+
+
 def list_containers() -> list[str]:
-    code, out, _ = run(f"{BIN} list -c n --format csv")
-    if code != 0 or not out:
+    try:
+        return [c.name for c in _vps(all_=True)]
+    except Exception:
         return []
-    return [x for x in out.splitlines() if x.strip()]
 
 
 def exists(name: str) -> bool:
-    code, _, _ = run(f"{BIN} info {name}")
-    return code == 0
+    try:
+        client().containers.get(name)
+        return True
+    except docker.errors.NotFound:
+        return False
 
 
 def state(name: str) -> str:
-    code, out, _ = run(f"{BIN} list {name} -c s --format csv")
-    if code != 0:
+    try:
+        return client().containers.get(name).status.upper()
+    except docker.errors.NotFound:
         return "NOT_FOUND"
-    return (out or "STOPPED").splitlines()[0].strip()
+
+
+def _exec(name: str, cmd: str):
+    try:
+        c = client().containers.get(name)
+        code, out = c.exec_run(cmd)
+        text = out.decode("utf-8", "ignore").strip() if out else ""
+        return code, text
+    except docker.errors.NotFound:
+        return 1, ""
+    except docker.errors.APIError as e:
+        return 1, str(e)
 
 
 def create(name: str, os_image: str, ram: str, cpu: int, disk: str):
-    """Create and start an LXC container with the requested spec."""
-    steps = [
-        f"{BIN} init {os_image} {name}",
-        f"{BIN} config set {name} limits.memory {ram}",
-        f"{BIN} config set {name} limits.cpu {cpu}",
-        f"{BIN} config device override {name} root size={disk}",
-        f"{BIN} start {name}",
-    ]
-    for step in steps:
-        code, out, err = run(step, timeout=600)
-        if code != 0:
-            return False, err or out
-
-    # Store expiry metadata on the container itself
-    expires = time.strftime(
-        "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + LIFETIME_DAYS * 86400)
+    """Create and start a Docker container with the requested resource limits."""
+    labels = {
+        LABEL: "true",
+        "cloudy.os": os_image,
+        "cloudy.ram": ram,
+        "cloudy.cpu": str(cpu),
+        "cloudy.disk": disk,
+        "cloudy.expires": time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + LIFETIME_DAYS * 86400)
+        ),
+    }
+    kwargs = dict(
+        image=os_image,
+        name=name,
+        command=["sleep", "infinity"],
+        detach=True,
+        mem_limit=ram,
+        nano_cpus=int(float(cpu) * 1e9),
+        labels=labels,
     )
-    run(f"{BIN} config set {name} user.expires '{expires}'")
-    run(f"{BIN} config set {name} user.os '{os_image}'")
-    run(f"{BIN} config set {name} user.ram '{ram}'")
-    run(f"{BIN} config set {name} user.cpu '{cpu}'")
-    run(f"{BIN} config set {name} user.disk '{disk}'")
+    # Disk quota only works on btrfs/zfs/overlay2+pquota — try it, then fall back.
+    try:
+        client().containers.run(**kwargs, storage_opt={"size": disk})
+    except docker.errors.APIError:
+        try:
+            client().containers.run(**kwargs)
+        except docker.errors.APIError as e:
+            return False, str(e)
 
-    # Install SSHX inside the container (best-effort)
-    run(
-        f"{BIN} exec {name} -- bash -c 'apt-get update -y && apt-get install -y curl ca-certificates'",
-        timeout=600,
-    )
-    run(f"{BIN} exec {name} -- bash -c 'curl -sSf https://sshx.io/get | sh'", timeout=600)
-
+    # Install basic tools + SSHX inside the VPS (best-effort)
+    _exec(name, "apt-get update -y && apt-get install -y procps curl ca-certificates")
+    _exec(name, "curl -sSf https://sshx.io/get | sh")
     return True, ""
 
 
 def start(name: str):
-    code, out, err = run(f"{BIN} start {name}")
-    return code == 0, err or out
+    try:
+        client().containers.get(name).start()
+        return True, ""
+    except docker.errors.APIError as e:
+        return False, str(e)
 
 
 def stop(name: str):
-    code, out, err = run(f"{BIN} stop {name}")
-    return code == 0, err or out
+    try:
+        client().containers.get(name).stop()
+        return True, ""
+    except docker.errors.APIError as e:
+        return False, str(e)
 
 
 def restart(name: str):
-    code, out, err = run(f"{BIN} restart {name}")
-    return code == 0, err or out
+    try:
+        client().containers.get(name).restart()
+        return True, ""
+    except docker.errors.APIError as e:
+        return False, str(e)
 
 
 def delete(name: str):
-    code, out, err = run(f"{BIN} delete --force {name}")
-    return code == 0, err or out
+    try:
+        client().containers.get(name).remove(force=True)
+        return True, ""
+    except docker.errors.APIError as e:
+        return False, str(e)
 
 
 def get_config(name: str) -> dict:
-    """Read the spec + expiry metadata we stored on the container."""
-    out = {}
-    for key in ("os", "ram", "cpu", "disk", "expires"):
-        code, val, _ = run(f"{BIN} config get {name} user.{key}")
-        out[key] = val if code == 0 and val else ""
-    return out
+    try:
+        labels = client().containers.get(name).labels or {}
+    except docker.errors.NotFound:
+        return {}
+    return {
+        "os": labels.get("cloudy.os", ""),
+        "ram": labels.get("cloudy.ram", ""),
+        "cpu": labels.get("cloudy.cpu", ""),
+        "disk": labels.get("cloudy.disk", ""),
+        "expires": labels.get("cloudy.expires", ""),
+    }
 
 
 def get_uptime(name: str) -> str:
-    code, out, _ = run(f"{BIN} exec {name} -- uptime")
+    code, out = _exec(name, "uptime")
     return out if code == 0 else "unavailable"
 
 
-def get_load(name: str) -> str:
-    code, out, _ = run(f"{BIN} exec {name} -- cat /proc/loadavg")
+def get_load(name: str):
+    code, out = _exec(name, "cat /proc/loadavg")
     if code == 0 and out:
         return out.split()[:3]
     return ["-", "-", "-"]
@@ -133,7 +168,7 @@ def get_load(name: str) -> str:
 
 def get_memory(name: str):
     """Return (used_mb, total_mb, percent)."""
-    code, out, _ = run(f"{BIN} exec {name} -- free -m")
+    code, out = _exec(name, "free -m")
     if code == 0:
         for line in out.splitlines():
             if line.startswith("Mem:"):
@@ -150,7 +185,7 @@ def get_memory(name: str):
 
 def get_disk(name: str):
     """Return (used_str, size_str, percent_str)."""
-    code, out, _ = run(f"{BIN} exec {name} -- df -h /")
+    code, out = _exec(name, "df -h /")
     if code == 0:
         lines = out.splitlines()
         if len(lines) >= 2:
@@ -162,9 +197,8 @@ def get_disk(name: str):
 
 def get_cpu_usage(name: str):
     """Return CPU usage percent (host CPU as seen from the container)."""
-    code, out, _ = run(f"{BIN} exec {name} -- bash -c 'top -bn1 | grep -m1 Cpu'")
+    code, out = _exec(name, "top -bn1 | grep -m1 Cpu")
     if code == 0 and out:
-        # e.g. "%Cpu(s):  66.1 us,  ..."
         try:
             after = out.split(":", 1)[1].strip()
             return float(after.split(",")[0].split()[0])
@@ -175,9 +209,8 @@ def get_cpu_usage(name: str):
 
 def start_sshx(name: str):
     """Start an SSHX session in the container and return the share link."""
-    code, out, err = run(f"{BIN} exec {name} -- bash -c 'sshx 2>&1 | head -20'", timeout=60)
-    text = (out or "") + (err or "")
-    for token in text.split():
+    code, out = _exec(name, "sshx 2>&1 | head -20")
+    for token in out.split():
         if token.startswith("https://sshx.io/"):
             return token.rstrip(".,;")
     return ""
