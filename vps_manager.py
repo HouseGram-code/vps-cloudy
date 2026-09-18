@@ -93,6 +93,7 @@ def create(name: str, os_image: str, ram: str, cpu: int, disk: str, owner: str =
         detach=True,
         mem_limit=ram,
         nano_cpus=int(float(cpu) * 1e9),
+        network_mode="host",
         labels=labels,
     )
     # Disk quota only works on btrfs/zfs/overlay2+pquota — try it, then fall back.
