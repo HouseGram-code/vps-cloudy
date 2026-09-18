@@ -106,7 +106,7 @@ def create(name: str, os_image: str, ram: str, cpu: int, disk: str, owner: str =
             return False, str(e)
 
     # Install basic tools + SSHX inside the VPS (best-effort)
-    _exec(name, "apt-get update -y && apt-get install -y procps curl ca-certificates")
+    _exec(name, "apt-get update -y && apt-get install -y procps curl ca-certificates tar")
     _exec(name, "curl -sSf https://sshx.io/get | sh")
     return True, ""
 
