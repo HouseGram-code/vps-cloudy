@@ -89,6 +89,7 @@ def create(name: str, os_image: str, ram: str, cpu: int, disk: str, owner: str =
     kwargs = dict(
         image=os_image,
         name=name,
+        hostname=name,
         command=["sleep", "infinity"],
         detach=True,
         mem_limit=ram,
@@ -250,7 +251,8 @@ def start_sshx(name: str):
             detail = "\n".join(x for x in (e1, o1, e2, o2) if x)
             return "", f"sshx install failed:\n{detail[:800]}"
 
-    # Start SSHX detached so the session stays alive; log to a file
+    # Clear any previous session log, then start SSHX detached
+    run(f"docker exec {name} sh -c 'rm -f /tmp/sshx.log'")
     run(f"docker exec -d {name} sh -c 'sshx > /tmp/sshx.log 2>&1'")
 
     # Poll the log for the share link
