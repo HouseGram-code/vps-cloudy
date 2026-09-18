@@ -2,7 +2,7 @@
 
 Commands:
   !help     — show help
-  !deploy   — create a new LXC VPS (interactive)
+  !deploy   — create a new VPS (interactive)
   !manage   — manage a VPS (buttons)
   !status   — ping + host load check (green/yellow/red)
 """
@@ -195,7 +195,7 @@ class ManageView(discord.ui.View):
         else:
             await interaction.followup.send(
                 "⚠️ Could not start SSHX. Make sure SSHX is installed in the container, or use:\n"
-                f"`lxc exec {self.name} -- bash`",
+                f"`docker exec -it {self.name} bash`",
                 ephemeral=True,
             )
 
@@ -234,7 +234,7 @@ class ConfirmDeleteView(discord.ui.View):
 async def run_deploy(msg: discord.Message, name: str, os_image: str, user: discord.User):
     stages = [
         ("Allocating resources", 15),
-        ("Creating LXC container", 40),
+        ("Creating container", 40),
         ("Installing operating system", 65),
         ("Configuring SSHX", 80),
         ("Finalizing deployment", 100),
@@ -291,14 +291,14 @@ async def on_ready():
 async def help_cmd(ctx):
     embed = discord.Embed(
         title="Cloudy VPS Bot — Help",
-        description="Manage your LXC VPS right from Discord.",
+        description="Manage your VPS right from Discord.",
         color=BLURPLE,
     )
     embed.add_field(
         name="Commands",
         value=(
             f"`{config.PREFIX}help` — show this message\n"
-            f"`{config.PREFIX}deploy` — create a new LXC VPS\n"
+            f"`{config.PREFIX}deploy` — create a new VPS\n"
             f"`{config.PREFIX}manage [name]` — open the VPS control panel\n"
             f"`{config.PREFIX}status` — check ping and server load"
         ),
