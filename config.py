@@ -16,6 +16,9 @@ DEFAULT_DISK = os.getenv("DEFAULT_DISK", "10g")
 NODE_NAME = os.getenv("NODE_NAME", "Local Node")
 OWNER_PREFIX = os.getenv("OWNER_PREFIX", "tbmen12")
 
+# How many VPS a single user may own. 0 = unlimited.
+MAX_VPS_PER_USER = int(os.getenv("MAX_VPS_PER_USER", "1"))
+
 # How many days a new VPS lives before it expires
 LIFETIME_DAYS = int(os.getenv("LIFETIME_DAYS", "15"))
 

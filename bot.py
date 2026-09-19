@@ -57,10 +57,8 @@ _VPS_SUFFIX_RE = re.compile(r"-vps-(\d+)$")
 # Single instance guard
 # --------------------------------------------------------------------------- #
 # Every reply used to show up twice because two copies of the bot were logged
-# in with the same token (e.g. an old `python bot.py` next to the
-# docker-compose container). Discord delivers each event to both sessions, so
-# we take an exclusive lock at startup and also ignore message ids we already
-# handled in this process.
+# in with the same token. Discord delivers each event to both sessions, so we
+# take an exclusive lock at startup and ignore message ids already handled.
 
 LOCK_PATH = os.getenv("BOT_LOCK_FILE", "/tmp/cloudy-vps-bot.lock")
 _lock_handle = None
@@ -111,11 +109,7 @@ def _other_bot_pids():
 
 
 def kill_stale_instances():
-    """Stop older copies of the bot still running on this host.
-
-    Two sessions on one token make Discord deliver every command twice, so
-    the newest process wins. Disable with AUTO_KILL_DUPLICATES=0.
-    """
+    """Stop older copies of the bot still running on this host."""
     pids = _other_bot_pids()
     if not pids:
         return []
@@ -141,9 +135,6 @@ def kill_stale_instances():
     return killed
 
 
-# Remember the ids of messages WE sent, so a message posted by our own bot
-# account that we never sent means a second instance is online somewhere else
-# (another host/container that our local checks cannot see).
 _own_message_ids: "OrderedDict[int, float]" = OrderedDict()
 _last_duplicate_warning = 0.0
 
@@ -271,21 +262,15 @@ async def _detect_foreign_instance(message: discord.Message):
     if message.id in _own_message_ids:
         return
     # The gateway event can arrive before our own HTTP call returned the id,
-    # so wait and re-check a few times before accusing anyone. Interaction
-    # responses in particular are confirmed asynchronously.
+    # so re-check a few times before accusing anyone.
     for _ in range(6):
         await asyncio.sleep(1)
         if message.id in _own_message_ids:
             return
-    # Startup grace period: messages sent by our previous process (or before
-    # this one was ready) are not evidence of a second live instance.
+    # Startup grace period: messages from a previous process are not evidence
+    # of a second live instance.
     if time.time() - STARTED_AT < 30:
         return
-    if _other_bot_pids():
-        # A local stale copy is a different (already reported) problem.
-        log.error(
-            "Another bot process is running on this host: %s", _other_bot_pids()
-        )
     log.error(
         "Duplicate instance detected: message %s was posted by this bot "
         "account but not by this process (build %s, pid %s).",
@@ -303,8 +288,8 @@ async def _detect_foreign_instance(message: discord.Message):
             "logged in with the same token, which is why answers appear twice.\n"
             f"This process: build `{BUILD_ID}`, pid `{os.getpid()}` on "
             f"`{socket.gethostname()}`.\n"
-            "Fix: stop the other copy — `docker compose down` and "
-            '`pkill -f "python.*bot.py"`, then start one copy again.'
+            "If it is not on this host, reset the bot token in the Discord "
+            "Developer Portal — that kills every other copy instantly."
         )
     except Exception:
         pass
@@ -325,9 +310,55 @@ def bar(percent: float, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def generate_name(user_id) -> str:
-    """Return the next free ``<prefix>-<user_id>-vps-<n>`` name for this user."""
-    return vm._next_free_name(user_id)
+# Deploys in flight, per user. Without this, clicking the OS buttons twice
+# (or spamming !deploy) let several containers be created before the first
+# one existed — that was the "unlimited VPS" bug.
+_deploy_locks: "dict[int, asyncio.Lock]" = {}
+_deploying: "set[int]" = set()
+
+
+def _deploy_lock(user_id: int) -> asyncio.Lock:
+    lock = _deploy_locks.get(int(user_id))
+    if lock is None:
+        lock = asyncio.Lock()
+        _deploy_locks[int(user_id)] = lock
+    return lock
+
+
+def quota_state(user_id):
+    """Return (owned, limit, in_flight) for this user."""
+    owned = vm.count_for_owner(user_id)
+    return owned, config.MAX_VPS_PER_USER, int(user_id) in _deploying
+
+
+def quota_blocked(user_id):
+    """Return an error message when the user may NOT create another VPS."""
+    owned, limit, in_flight = quota_state(user_id)
+    if in_flight:
+        return "⏳ A VPS is already being created for you — wait for it to finish."
+    if limit > 0 and owned >= limit:
+        word = "VPS" if limit == 1 else f"{limit} VPS"
+        return (
+            f"❌ You already have {owned}/{limit} {word}. "
+            f"Use `{config.PREFIX}manage` to control it, or delete one first."
+        )
+    return ""
+
+
+def owner_label(user) -> str:
+    """Discord name used as the container-name prefix for this owner."""
+    if user is None:
+        return ""
+    return getattr(user, "name", None) or getattr(user, "display_name", "") or ""
+
+
+def generate_name(user_id, user=None) -> str:
+    """Next free ``<owner-name>-<user_id>-vps-<n>`` name for this owner.
+
+    The prefix is the name of the person who RECEIVES the VPS, so a machine
+    issued or transferred to someone else never carries another user's name.
+    """
+    return vm._next_free_name(user_id, owner_label(user))
 
 
 def vps_number(name: str) -> int:
@@ -428,19 +459,50 @@ async def build_manage_embed(name: str, number: int) -> discord.Embed:
 # Views
 # --------------------------------------------------------------------------- #
 class OSSelectView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, requester_id=None):
         super().__init__(timeout=120)
         self.chosen = None
+        self.requester_id = int(requester_id) if requester_id is not None else None
+        self.used = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Only the person who ran !deploy may use these buttons."""
+        if self.requester_id is not None and interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                f"⛔ This deployment is not yours. Run `{config.PREFIX}deploy`.",
+                ephemeral=True,
+            )
+            return False
+        if self.used:
+            await interaction.response.send_message(
+                "⏳ This deployment was already started.", ephemeral=True
+            )
+            return False
+        return True
 
     async def _handle(self, interaction: discord.Interaction, os_image: str):
+        self.used = True
         self.chosen = os_image
         for child in self.children:
             child.disabled = True
         msg = interaction.message
         await interaction.response.edit_message(view=self)
+        self.stop()
 
-        name = generate_name(interaction.user.id)
-        await run_deploy(msg, name, os_image, interaction.user)
+        user = interaction.user
+        # Serialise per user and re-check the quota right before creating:
+        # the check in !deploy happened before the container existed.
+        async with _deploy_lock(user.id):
+            blocked = quota_blocked(user.id)
+            if blocked:
+                await msg.edit(content=blocked, embed=None, view=None)
+                return
+            _deploying.add(int(user.id))
+            try:
+                name = generate_name(user.id, user)
+                await run_deploy(msg, name, os_image, user)
+            finally:
+                _deploying.discard(int(user.id))
 
     @discord.ui.button(label="Ubuntu 22.04", emoji="🐧", style=discord.ButtonStyle.primary)
     async def ubuntu22(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -653,7 +715,9 @@ class TransferModal(discord.ui.Modal, title="Transfer VPS"):
             )
             return
 
-        ok, result = await asyncio.to_thread(vm.transfer, self.name, uid)
+        ok, result = await asyncio.to_thread(
+            vm.transfer, self.name, uid, owner_label(target)
+        )
         if ok:
             try:
                 await self.manage_message.edit(
@@ -758,6 +822,7 @@ async def help_cmd(ctx):
             f"{E_VPS} `{config.PREFIX}deploy` — create a new VPS\n"
             f"{E_GEAR} `{config.PREFIX}manage [name]` — open the VPS control panel\n"
             f"{E_WORLD} `{config.PREFIX}status` — check ping and server load\n"
+            f"{E_GEAR} `{config.PREFIX}docker [name]` — enable Docker inside your VPS\n"
             f"{E_VPS} `{config.PREFIX}about` — specs and limits"
         ),
         inline=False,
@@ -769,6 +834,8 @@ async def help_cmd(ctx):
             f"`{config.PREFIX}give <id> <ram> <cpu> <disk>` — issue a VPS\n"
             f"`{config.PREFIX}transfer <name> <id>` — reassign a VPS to another user\n"
             f"`{config.PREFIX}ban <id>` / `{config.PREFIX}unban <id>` — ban/unban\n"
+            f"`{config.PREFIX}purge [all|<id>]` — delete all VPS (or one user's)\n"
+            f"`{config.PREFIX}quota [id]` — show VPS count vs limit\n"
             f"`{config.PREFIX}instances` — check for duplicate bot processes"
         ),
         inline=False,
@@ -808,8 +875,9 @@ async def about_cmd(ctx):
         name="Limits",
         value=(
             f"**Lifetime:** {config.LIFETIME_DAYS} days\n"
-            "**Per user:** 1 VPS\n"
-            f"**Console:** {E_CHAIN} SSHX (browser terminal)"
+            f"**Per user:** {config.MAX_VPS_PER_USER or 'unlimited'} VPS\n"
+            f"**Console:** {E_CHAIN} SSHX (browser terminal)\n"
+            f"**Docker:** supported inside the VPS (`{config.PREFIX}docker`)"
         ),
         inline=False,
     )
@@ -822,8 +890,9 @@ async def deploy(ctx):
     if store.is_banned(ctx.author.id):
         await ctx.send("🚫 You are banned from using this bot.")
         return
-    if vm.owner_has_vps(ctx.author.id):
-        await ctx.send(f"❌ You already have a VPS. Use `{config.PREFIX}manage` to control it.")
+    blocked = quota_blocked(ctx.author.id)
+    if blocked:
+        await ctx.send(blocked)
         return
 
     embed = discord.Embed(
@@ -834,7 +903,7 @@ async def deploy(ctx):
         ),
         color=BLURPLE,
     )
-    view = OSSelectView()
+    view = OSSelectView(requester_id=ctx.author.id)
     await ctx.send(embed=embed, view=view)
 
 
@@ -1038,8 +1107,17 @@ class IssueVPSModal(discord.ui.Modal, title="Issue VPS"):
                 f"⛔ {target.mention} is banned.", ephemeral=True
             )
             return
+        owned, limit, _ = quota_state(uid)
+        if limit > 0 and owned >= limit:
+            await interaction.followup.send(
+                f"❌ {target.mention} already has {owned}/{limit} VPS. "
+                f"Use `{config.PREFIX}give {uid} <ram> <cpu> <disk> <os> force` "
+                "to issue anyway.",
+                ephemeral=True,
+            )
+            return
 
-        name = generate_name(uid)
+        name = generate_name(uid, target)
         ok, err = await asyncio.to_thread(
             vm.create,
             name,
@@ -1089,6 +1167,67 @@ class UnbanModal(discord.ui.Modal, title="Unban user"):
         await interaction.followup.send(f"✅ User `{uid}` unbanned.", ephemeral=True)
 
 
+class PurgeConfirmView(discord.ui.View):
+    """Two-step confirmation before mass deletion."""
+
+    def __init__(self, names, requester_id, scope: str):
+        super().__init__(timeout=60)
+        self.names = list(names)
+        self.requester_id = int(requester_id)
+        self.scope = scope
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id or not is_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ Not your confirmation.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, delete them", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=f"🗑️ Deleting {len(self.names)} VPS…", view=self
+        )
+        deleted, failed = await asyncio.to_thread(vm.delete_many, self.names)
+        text = f"✅ Deleted **{len(deleted)}** VPS ({self.scope})."
+        if failed:
+            detail = "\n".join(f"• `{n}` — {e[:80]}" for n, e in failed[:10])
+            text += f"\n⚠️ Failed ({len(failed)}):\n{detail}"
+        await interaction.edit_original_response(content=text, view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
+
+
+class PurgeUserModal(discord.ui.Modal, title="Delete all VPS of a user"):
+    user_id = discord.ui.TextInput(label="User ID", placeholder="123456789012345678")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            uid = int(str(self.user_id.value).strip())
+        except ValueError:
+            await interaction.followup.send("❌ Invalid user ID.", ephemeral=True)
+            return
+        names = vm.list_containers_for_owner(uid)
+        if not names:
+            await interaction.followup.send(f"User `{uid}` has no VPS.", ephemeral=True)
+            return
+        lines = "\n".join(f"• `{n}`" for n in names[:20])
+        await interaction.followup.send(
+            f"⚠️ Delete **{len(names)}** VPS owned by <@{uid}>?\n{lines}\n"
+            "**This cannot be undone.**",
+            view=PurgeConfirmView(names, interaction.user.id, f"owner {uid}"),
+            ephemeral=True,
+        )
+
+
 class AdminView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1104,6 +1243,31 @@ class AdminView(discord.ui.View):
     @discord.ui.button(label="Unban", emoji="✅", style=discord.ButtonStyle.gray)
     async def unban_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(UnbanModal())
+
+    @discord.ui.button(label="Delete ALL VPS", emoji="💣", style=discord.ButtonStyle.danger, row=1)
+    async def purge_all_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ Admins only.", ephemeral=True)
+            return
+        names = vm.list_containers()
+        if not names:
+            await interaction.response.send_message("No VPS to delete.", ephemeral=True)
+            return
+        preview = "\n".join(f"• `{n}`" for n in names[:20])
+        extra = f"\n…and {len(names) - 20} more" if len(names) > 20 else ""
+        await interaction.response.send_message(
+            f"⚠️ **Delete ALL {len(names)} VPS on this node?**\n{preview}{extra}\n"
+            "**This cannot be undone.**",
+            view=PurgeConfirmView(names, interaction.user.id, "all VPS"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Delete user's VPS", emoji="🧹", style=discord.ButtonStyle.danger, row=1)
+    async def purge_user_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user.id):
+            await interaction.response.send_message("⛔ Admins only.", ephemeral=True)
+            return
+        await interaction.response.send_modal(PurgeUserModal())
 
     @discord.ui.button(label="List VPS", emoji="📋", style=discord.ButtonStyle.blurple)
     async def list_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1134,7 +1298,8 @@ async def admin_cmd(ctx):
         description=(
             f"**Node:** `{config.NODE_NAME}`\n"
             f"**Active VPS:** {total}\n"
-            f"**Banned users:** {banned_count}\n\n"
+            f"**Banned users:** {banned_count}\n"
+            f"**Limit per user:** {config.MAX_VPS_PER_USER or 'unlimited'}\n\n"
             "Use the buttons below."
         ),
         color=YELLOW,
@@ -1143,7 +1308,7 @@ async def admin_cmd(ctx):
 
 
 @bot.command(name="give")
-async def give_cmd(ctx, user_id: int = None, ram: str = "8g", cpu: int = 1, disk: str = "10g", os_img: str = "ubuntu:24.04"):
+async def give_cmd(ctx, user_id: int = None, ram: str = "8g", cpu: int = 1, disk: str = "10g", os_img: str = "ubuntu:24.04", force: str = ""):
     if not is_admin(ctx.author.id):
         await ctx.send("⛔ Admins only.")
         return
@@ -1165,7 +1330,15 @@ async def give_cmd(ctx, user_id: int = None, ram: str = "8g", cpu: int = 1, disk
         return
 
     existing = vm.list_containers_for_owner(user_id)
-    name = generate_name(user_id)
+    limit = config.MAX_VPS_PER_USER
+    if limit > 0 and len(existing) >= limit and force.lower() not in ("force", "-f", "yes"):
+        await ctx.send(
+            f"❌ {target.mention} already has {len(existing)}/{limit} VPS.\n"
+            f"Add `force` at the end to issue anyway: "
+            f"`{config.PREFIX}give {user_id} {ram} {cpu} {disk} {os_img} force`"
+        )
+        return
+    name = generate_name(user_id, target)
     note = f" (already has {len(existing)})" if existing else ""
     await ctx.send(f"⏳ Creating `{name}` for {target.mention}{note}...")
     ok, err = await asyncio.to_thread(vm.create, name, os_img, ram, cpu, disk, str(user_id))
@@ -1200,7 +1373,9 @@ async def transfer_cmd(ctx, name: str = None, new_user_id: int = None):
         return
 
     await ctx.send(f"⏳ Transferring `{name}` to {target.mention}...")
-    ok, result = await asyncio.to_thread(vm.transfer, name, new_user_id)
+    ok, result = await asyncio.to_thread(
+        vm.transfer, name, new_user_id, owner_label(target)
+    )
     if not ok:
         await ctx.send(f"❌ Transfer failed: {result[:1000]}")
         return
@@ -1210,6 +1385,90 @@ async def transfer_cmd(ctx, name: str = None, new_user_id: int = None):
         f"{E_VPS} VPS transferred. New name: `{result}` — owner {target.mention}.\n"
         + delivery_note(target, delivered)
     )
+
+
+@bot.command(name="purge", aliases=["deleteall", "wipe"])
+async def purge_cmd(ctx, target: str = None):
+    """Delete every VPS on the node, or every VPS of one user."""
+    if not is_admin(ctx.author.id):
+        await ctx.send("⛔ Admins only.")
+        return
+
+    if target and target.lower() not in ("all", "*"):
+        digits = "".join(ch for ch in target if ch.isdigit())
+        if not digits:
+            await ctx.send(f"Usage: `{config.PREFIX}purge [all|<user_id>]`")
+            return
+        names = vm.list_containers_for_owner(digits)
+        scope = f"owner {digits}"
+        header = f"⚠️ Delete **{len(names)}** VPS owned by <@{digits}>?"
+    else:
+        names = vm.list_containers()
+        scope = "all VPS"
+        header = f"⚠️ **Delete ALL {len(names)} VPS on this node?**"
+
+    if not names:
+        await ctx.send("Nothing to delete — no matching VPS.")
+        return
+
+    preview = "\n".join(f"• `{n}`" for n in names[:20])
+    extra = f"\n…and {len(names) - 20} more" if len(names) > 20 else ""
+    await ctx.send(
+        f"{header}\n{preview}{extra}\n**This cannot be undone.**",
+        view=PurgeConfirmView(names, ctx.author.id, scope),
+    )
+
+
+@bot.command(name="quota")
+async def quota_cmd(ctx, user_id: int = None):
+    """Show how many VPS a user owns against the limit."""
+    uid = user_id if user_id and is_admin(ctx.author.id) else ctx.author.id
+    owned, limit, in_flight = quota_state(uid)
+    names = vm.list_containers_for_owner(uid)
+    lines = "\n".join(f"• `{n}`" for n in names) or "—"
+    await ctx.send(
+        f"{E_VPS} <@{uid}> owns **{owned}**"
+        + (f"/{limit}" if limit > 0 else " (no limit)")
+        + (" • deploy in progress" if in_flight else "")
+        + f"\n{lines}"
+    )
+
+
+@bot.command(name="docker")
+async def docker_cmd(ctx, name: str = None):
+    """Install and start the Docker engine inside your VPS."""
+    own = vm.list_containers_for_owner(ctx.author.id)
+    admin = is_admin(ctx.author.id)
+    if name is None:
+        if not own:
+            await ctx.send(
+                f"{E_VPS} You have no VPS yet. Create one with `{config.PREFIX}deploy`."
+            )
+            return
+        if len(own) > 1:
+            lines = "\n".join(f"• `{c}`" for c in own)
+            await ctx.send(f"Pick one: `{config.PREFIX}docker <name>`\n{lines}")
+            return
+        name = own[0]
+    elif name not in own and not (admin and vm.exists(name)):
+        await ctx.send(f"❌ VPS `{name}` not found, or it belongs to another user.")
+        return
+
+    msg = await ctx.send(
+        f"{E_GEAR} Setting up Docker inside `{name}`… this can take a minute."
+    )
+    ok, detail = await asyncio.to_thread(vm.start_docker_inside, name)
+    if ok:
+        await msg.edit(
+            content=(
+                f"{E_VPS} Docker is ready inside `{name}` — `{detail}`\n"
+                "Try it in the console: `docker run --rm hello-world`\n"
+                "After a VPS restart, start it again with `dockerd-start` "
+                f"or `{config.PREFIX}docker`."
+            )
+        )
+    else:
+        await msg.edit(content=f"❌ Docker setup failed.\n```{detail[:900]}```")
 
 
 @bot.command(name="instances")
@@ -1235,8 +1494,7 @@ async def instances_cmd(ctx):
     else:
         lines.append(
             "✅ No other bot process on this host. If replies still double, "
-            "the second copy runs elsewhere (another server/container) with the "
-            "same token."
+            "the second copy runs elsewhere — reset the bot token to kill it."
         )
     await ctx.send("\n".join(lines))
 
@@ -1283,8 +1541,7 @@ if __name__ == "__main__":
         print(
             f"Another Cloudy VPS Bot instance already holds {LOCK_PATH}.\n"
             "Running two copies with the same token makes every reply appear "
-            "twice — stop the other one (e.g. `docker compose down` or kill the "
-            "stray `python bot.py`) and start again.",
+            "twice — stop the other one and start again.",
             file=sys.stderr,
         )
         raise SystemExit(1)

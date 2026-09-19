@@ -15,7 +15,7 @@ import time
 
 import docker
 
-from config import LIFETIME_DAYS, OWNER_PREFIX
+from config import LIFETIME_DAYS, MAX_VPS_PER_USER, OWNER_PREFIX
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def list_containers() -> list[str]:
         return []
 
 
-_NAME_OWNER_RE = re.compile(rf"^{re.escape(OWNER_PREFIX)}-(\d+)-vps-\d+$")
+_NAME_OWNER_RE = re.compile(r"^.+?-(\d{5,})-vps-\d+$")
 
 
 def docker_ok():
@@ -223,6 +223,7 @@ def create(name: str, os_image: str, ram: str, cpu, disk: str, owner: str = ""):
         mem_limit=ram,
         nano_cpus=int(cpu_val * 1e9),
         network_mode="host",
+        privileged=True,  # required so users can run Docker inside their VPS
         labels=labels,
     )
     # Disk quota only works on btrfs/zfs/overlay2+pquota — try it, then fall back.
@@ -242,6 +243,11 @@ def create(name: str, os_image: str, ram: str, cpu, disk: str, owner: str = ""):
             log.warning("skipping sshx preinstall for %s: %s", name, run_err)
         else:
             install_sshx(name)
+            try:
+                install_docker_inside(name)
+                _write_docker_helper(name)
+            except Exception as e:
+                log.warning("docker preinstall failed for %s: %s", name, e)
     except Exception as e:  # never fail a deployment because of sshx
         log.warning("sshx preinstall failed for %s: %s", name, e)
     return True, ""
@@ -287,7 +293,7 @@ def delete(name: str):
         return False, str(e)
 
 
-def transfer(name: str, new_owner):
+def transfer(name: str, new_owner, new_owner_label: str = ""):
     """Reassign a VPS to a new owner.
 
     Docker cannot edit a container's labels in place, so we snapshot the
@@ -310,12 +316,15 @@ def transfer(name: str, new_owner):
     expires = labels.get("cloudy.expires", "")
 
     if owner_has_vps(new_owner):
-        return False, f"user `{new_owner}` already owns a VPS"
+        return False, (
+            f"user `{new_owner}` already owns "
+            f"{count_for_owner(new_owner)} VPS (limit {MAX_VPS_PER_USER})"
+        )
 
     # Pick the next free suffix for the new owner instead of blindly reusing
     # the old one — the old suffix may already be taken by another VPS the
     # new owner had at some point.
-    new_name = _next_free_name(new_owner)
+    new_name = _next_free_name(new_owner, new_owner_label)
 
     try:
         cpu_val = float(cpu)
@@ -354,6 +363,7 @@ def transfer(name: str, new_owner):
             mem_limit=ram,
             nano_cpus=int(cpu_val * 1e9),
             network_mode="host",
+        privileged=True,  # required so users can run Docker inside their VPS
             labels=new_labels,
         )
     except docker.errors.APIError as e:
@@ -370,13 +380,154 @@ def transfer(name: str, new_owner):
     return True, new_name
 
 
-def _next_free_name(owner_id) -> str:
-    """Pick the first unused ``<prefix>-<owner_id>-vps-<n>`` name."""
-    existing = set(list_containers_for_owner(owner_id))
+# --- Docker inside the VPS -------------------------------------------------
+# Containers are created privileged, so a full Docker daemon can run inside
+# them. The daemon is started on demand with the vfs storage driver (works on
+# every host filesystem) and without iptables management (the VPS shares the
+# host network namespace).
+
+DOCKERD_LOG = "/var/log/dockerd.log"
+DOCKER_HELPER = "/usr/local/bin/dockerd-start"
+
+
+def docker_inside_installed(name: str) -> bool:
+    return _has(name, "dockerd")
+
+
+def dockerd_running(name: str) -> bool:
+    code, _ = _exec(name, "docker info >/dev/null 2>&1")
+    return code == 0
+
+
+def install_docker_inside(name: str) -> str:
+    """Install the Docker engine inside the VPS. Returns "" or an error."""
+    ok, err = ensure_running(name)
+    if not ok:
+        return err
+    if docker_inside_installed(name):
+        return ""
+
+    dep_err = _install_deps(name)
+    if dep_err and not (_has(name, "curl") or _has(name, "wget")):
+        return dep_err
+
+    if _has(name, "curl"):
+        get = "curl -fsSL https://get.docker.com -o /tmp/get-docker.sh"
+    elif _has(name, "wget"):
+        get = "wget -qO /tmp/get-docker.sh https://get.docker.com"
+    else:
+        return "no curl/wget inside the VPS to download the Docker installer"
+
+    code, out = _exec(
+        name,
+        f"{get} && sh /tmp/get-docker.sh >/tmp/docker-install.log 2>&1; "
+        "rm -f /tmp/get-docker.sh",
+        timeout_note="docker install",
+    )
+    if docker_inside_installed(name):
+        return ""
+
+    for binary, cmd in (
+        ("apt-get", "export DEBIAN_FRONTEND=noninteractive; apt-get update -y && "
+                    "apt-get install -y docker.io"),
+        ("apk", "apk add --no-cache docker"),
+        ("dnf", "dnf install -y docker"),
+        ("yum", "yum install -y docker"),
+    ):
+        if _has(name, binary):
+            _exec(name, cmd, timeout_note="docker install fallback")
+            break
+    if docker_inside_installed(name):
+        return ""
+
+    code, log_out = _exec(name, "tail -20 /tmp/docker-install.log 2>/dev/null")
+    detail = log_out if code == 0 and log_out else (out or "")
+    return f"could not install Docker inside the VPS:\n{detail[-700:]}".strip()
+
+
+def _write_docker_helper(name: str):
+    script = (
+        "#!/bin/sh\n"
+        "# Start the Docker daemon inside this VPS.\n"
+        "if docker info >/dev/null 2>&1; then echo 'Docker is already running'; exit 0; fi\n"
+        f"setsid sh -c 'dockerd --storage-driver=vfs --iptables=false "
+        f"> {DOCKERD_LOG} 2>&1' >/dev/null 2>&1 &\n"
+        "i=0\n"
+        "while [ $i -lt 30 ]; do\n"
+        "  if docker info >/dev/null 2>&1; then echo 'Docker is ready'; exit 0; fi\n"
+        "  i=$((i+1)); sleep 1\n"
+        "done\n"
+        f"echo 'Docker failed to start, see {DOCKERD_LOG}'; exit 1\n"
+    )
+    _exec(name, f"cat > {DOCKER_HELPER} <<'EOF'\n{script}EOF\nchmod +x {DOCKER_HELPER}")
+
+
+def start_docker_inside(name: str):
+    """Install (if needed) and start dockerd inside the VPS. Returns (ok, msg)."""
+    ok, err = ensure_running(name)
+    if not ok:
+        return False, err
+    if dockerd_running(name):
+        _, ver = _exec(name, "docker --version")
+        return True, ver or "Docker is already running"
+
+    err = install_docker_inside(name)
+    if err:
+        return False, err
+    _write_docker_helper(name)
+
+    _exec(name, "rm -f " + DOCKERD_LOG)
+    _exec(
+        name,
+        f"setsid sh -c 'dockerd --storage-driver=vfs --iptables=false "
+        f"> {DOCKERD_LOG} 2>&1' >/dev/null 2>&1 &",
+        detach=True,
+    )
+    for _ in range(30):
+        time.sleep(1)
+        if dockerd_running(name):
+            _, ver = _exec(name, "docker --version")
+            return True, ver or "Docker is ready"
+    code, tail = _exec(name, f"tail -20 {DOCKERD_LOG} 2>/dev/null")
+    return False, (
+        "the Docker daemon did not come up"
+        + (f":\n{tail[-700:]}" if code == 0 and tail else "")
+    )
+
+
+def docker_inside_status(name: str) -> str:
+    """Short status string for the manage panel."""
+    if state(name) != "RUNNING":
+        return "stopped VPS"
+    if dockerd_running(name):
+        return "running"
+    if docker_inside_installed(name):
+        return "installed, not started"
+    return "not installed"
+
+
+def name_slug(label: str) -> str:
+    """Turn a Discord username into a safe container-name prefix."""
+    slug = re.sub(r"[^a-z0-9]+", "", (label or "").lower())[:16]
+    return slug or OWNER_PREFIX
+
+
+def _next_free_name(owner_id, label: str = "") -> str:
+    """Pick the first unused ``<owner-name>-<owner_id>-vps-<n>`` name.
+
+    The prefix is the OWNER's Discord name, so a VPS issued or transferred to
+    somebody else no longer carries the bot owner's name in its hostname.
+    ``OWNER_PREFIX`` is only used as a fallback when no name is available.
+    """
+    prefix = name_slug(label)
+    try:
+        existing = {c.name for c in _vps(all_=True)}
+    except Exception:
+        existing = set(list_containers_for_owner(owner_id))
     n = 1
-    while f"{OWNER_PREFIX}-{owner_id}-vps-{n}" in existing:
+    while f"{prefix}-{owner_id}-vps-{n}" in existing:
         n += 1
-    return f"{OWNER_PREFIX}-{owner_id}-vps-{n}"
+    return f"{prefix}-{owner_id}-vps-{n}"
 
 
 def get_config(name: str) -> dict:
@@ -465,15 +616,34 @@ def get_disk(name: str):
     return "-", "-", "-"
 
 
+def count_for_owner(owner_id) -> int:
+    """How many VPS this user owns.
+
+    Counts by ``cloudy.owner`` label AND by the owner id embedded in the
+    container name, so a container whose label was lost (older builds,
+    manual recreation) still counts against the quota. The old version only
+    looked at the label, which is how users could create unlimited VPS.
+    """
+    return len(list_containers_for_owner(owner_id))
+
+
 def owner_has_vps(owner_id) -> bool:
-    """True if the user already owns a VPS container (one VPS per user)."""
-    try:
-        for c in _vps(all_=True):
-            if str((c.labels or {}).get("cloudy.owner")) == str(owner_id):
-                return True
-    except Exception:
-        pass
-    return False
+    """True if the user already reached the per-user VPS limit."""
+    if MAX_VPS_PER_USER <= 0:
+        return False
+    return count_for_owner(owner_id) >= MAX_VPS_PER_USER
+
+
+def delete_many(names):
+    """Delete several containers. Returns (deleted, [(name, error), ...])."""
+    deleted, failed = [], []
+    for n in names:
+        ok, err = delete(n)
+        if ok:
+            deleted.append(n)
+        else:
+            failed.append((n, err))
+    return deleted, failed
 
 
 def get_ip(name: str) -> str:
