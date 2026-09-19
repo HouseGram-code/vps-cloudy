@@ -1,8 +1,21 @@
+# Secrets / local state — must never be committed
 .env
+.env.local
 data.json
-nvapi-test.html
-nvapi-test.py
+
+# Local test scripts with hard-coded API keys (do not commit)
+nvapi-test.*
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / OS
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db

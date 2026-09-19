@@ -1,4 +1,4 @@
-"""Cloudy VPS Discord Bot — v1.0
+"""Cloudy VPS Discord Bot.
 
 Commands:
   !help     — show help
@@ -8,15 +8,23 @@ Commands:
 """
 
 import asyncio
+import logging
 import os
+import re
 import time
 
 import discord
 from discord.ext import commands
 
 import config
-import vps_manager as vm
 import store
+import vps_manager as vm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("cloudy")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -28,30 +36,50 @@ YELLOW = discord.Color.gold()
 RED = discord.Color.red()
 BLURPLE = discord.Color.blurple()
 
+# --- Custom server emojis -------------------------------------------------
+E_VPS = "<:6017vps:1550844331898699906>"                     # !deploy / VPS
+E_GEAR = "<a:957955purplegear:1550844906761887864>"          # !manage
+E_HELP = "<a:550231purplequestionmark:1550845013741805648>"  # !help
+E_CHAIN = "<a:427726purplechain:1550845151977676911>"        # SSHX link
+E_WORLD = "<a:474377purpleworld:1550845303756685362>"        # !status
+
+# Matches the trailing "-vps-<N>" suffix inside a container name.
+_VPS_SUFFIX_RE = re.compile(r"-vps-(\d+)$")
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def bar(percent: float, width: int = 12) -> str:
-    filled = int(width * percent / 100)
+    pct = max(0.0, min(100.0, float(percent)))
+    filled = int(width * pct / 100)
     return "█" * filled + "░" * (width - filled)
 
 
-def generate_name(user_id: int) -> str:
-    n = len(vm.list_containers()) + 1
-    return f"{config.OWNER_PREFIX}-{user_id}-vps-{n}"
+def generate_name(user_id) -> str:
+    """Return the next free ``<prefix>-<user_id>-vps-<n>`` name for this user."""
+    return vm._next_free_name(user_id)
+
+
+def vps_number(name: str) -> int:
+    """Extract the trailing ``-vps-N`` number from a container name (default 1)."""
+    m = _VPS_SUFFIX_RE.search(name or "")
+    return int(m.group(1)) if m else 1
 
 
 def days_left(expires: str) -> int:
     try:
         exp = time.mktime(time.strptime(expires, "%Y-%m-%d %H:%M:%S"))
         return max(0, int((exp - time.time()) // 86400))
-    except ValueError:
+    except (ValueError, TypeError):
         return 0
 
 
 def is_admin(user_id) -> bool:
-    return int(user_id) in config.ADMIN_IDS
+    try:
+        return int(user_id) in config.ADMIN_IDS
+    except (TypeError, ValueError):
+        return False
 
 
 async def build_manage_embed(name: str, number: int) -> discord.Embed:
@@ -71,9 +99,14 @@ async def build_manage_embed(name: str, number: int) -> discord.Embed:
     running = st.upper() == "RUNNING"
     color = GREEN if running else (YELLOW if st == "STOPPED" else RED)
 
+    owner = info.get("owner") or vm.owner_of(name)
     embed = discord.Embed(
-        title=f"VPS Management - VPS {number}",
-        description=f"Managing container: `{name}` on node `{config.NODE_NAME}`",
+        title=f"{E_GEAR} VPS Management — VPS {number}",
+        description=(
+            f"{E_VPS} Container: `{name}`\n"
+            f"Node: `{config.NODE_NAME}`\n"
+            f"Owner: {f'<@{owner}>' if owner else '—'}"
+        ),
         color=color,
     )
 
@@ -150,10 +183,12 @@ class OSSelectView(discord.ui.View):
 
 
 class ManageView(discord.ui.View):
-    def __init__(self, name: str, number: int, admin: bool = False):
+    def __init__(self, name: str, number: int, admin: bool = False, owner_id=None):
         super().__init__(timeout=None)
         self.name = name
         self.number = number
+        self.admin = admin
+        self.owner_id = str(owner_id) if owner_id is not None else vm.owner_of(name)
         if admin:
             btn = discord.ui.Button(
                 label="Transfer",
@@ -162,6 +197,16 @@ class ManageView(discord.ui.View):
             )
             btn.callback = self._transfer_callback
             self.add_item(btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Only the VPS owner (or an admin) may press these buttons."""
+        uid = str(interaction.user.id)
+        if uid == self.owner_id or is_admin(interaction.user.id):
+            return True
+        await interaction.response.send_message(
+            "⛔ Это не ваш VPS.", ephemeral=True
+        )
+        return False
 
     async def _transfer_callback(self, interaction: discord.Interaction):
         view = TransferConfirmView(self.name, interaction.message)
@@ -211,14 +256,18 @@ class ManageView(discord.ui.View):
             view = discord.ui.View()
             view.add_item(discord.ui.Button(label="Open Console", url=link))
             await interaction.followup.send(
-                "🔗 Your SSHX console is ready. **Never share this link** — anyone with it can control your VPS.",
+                f"{E_CHAIN} Консоль SSHX готова: {link}\n"
+                "**Никому не передавайте эту ссылку** — "
+                "у любого, кто её откроет, будет полный доступ к VPS.",
                 view=view,
                 ephemeral=True,
             )
         else:
             await interaction.followup.send(
-                f"⚠️ Could not start SSHX.\n```{err[:1000]}```\n"
-                f"Manual access: `docker exec -it {self.name} bash`",
+                f"⚠️ Не удалось запустить SSHX.\n```{err[:900]}```\n"
+                "Нажмите «Перезапустить консоль» ниже или "
+                "проверьте, что VPS запущен и у него есть интернет.",
+                view=ConsoleRetryView(self.name),
                 ephemeral=True,
             )
 
@@ -228,6 +277,36 @@ class ManageView(discord.ui.View):
         await interaction.response.send_message(
             f"⚠️ Delete VPS `{self.name}`? This cannot be undone.", view=view, ephemeral=True
         )
+
+
+class ConsoleRetryView(discord.ui.View):
+    """Kills a stale sshx process and starts a fresh session."""
+
+    def __init__(self, name: str):
+        super().__init__(timeout=300)
+        self.name = name
+
+    @discord.ui.button(
+        label="Перезапустить консоль",
+        emoji="🔁",
+        style=discord.ButtonStyle.blurple,
+    )
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        link, err = await asyncio.to_thread(vm.start_sshx, self.name, True)
+        if link:
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="Open Console", url=link))
+            await interaction.followup.send(
+                f"{E_CHAIN} Новая сессия SSHX: {link}\n**Не делитесь ссылкой.**",
+                view=view,
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ Снова не вышло.\n```{err[:900]}```",
+                ephemeral=True,
+            )
 
 
 class ConfirmDeleteView(discord.ui.View):
@@ -327,7 +406,7 @@ async def run_deploy(msg: discord.Message, name: str, os_image: str, user: disco
 
     for text, pct in stages:
         embed = discord.Embed(
-            title="🚀 VPS Deployment",
+            title=f"{E_VPS} VPS Deployment",
             description=(
                 f"**Container:** `{name}`\n"
                 f"**OS:** {os_image}\n"
@@ -358,10 +437,10 @@ async def run_deploy(msg: discord.Message, name: str, os_image: str, user: disco
         await msg.edit(embed=embed)
         return
 
-    n = len(vm.list_containers())
+    n = vps_number(name)
     embed = await build_manage_embed(name, n)
-    embed.title = f"✅ VPS Deployed - VPS {n}"
-    await msg.edit(embed=embed, view=ManageView(name, n))
+    embed.title = f"{E_VPS} VPS Deployed — VPS {n}"
+    await msg.edit(embed=embed, view=ManageView(name, n, owner_id=user.id))
 
 
 # --------------------------------------------------------------------------- #
@@ -371,22 +450,27 @@ async def run_deploy(msg: discord.Message, name: str, os_image: str, user: disco
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Cloudy VPS Bot v{config.BOT_VERSION} ready. Prefix: {config.PREFIX}")
+    ok, err = await asyncio.to_thread(vm.docker_ok)
+    if ok:
+        log.info("Docker daemon reachable — VPS management enabled.")
+    else:
+        log.error("Docker daemon NOT reachable: %s", err)
 
 
 @bot.command(name="help")
 async def help_cmd(ctx):
     embed = discord.Embed(
-        title="Cloudy VPS Bot — Help",
-        description="Manage your VPS right from Discord.",
+        title=f"{E_HELP} Cloudy VPS Bot — Help",
+        description=f"{E_VPS} Manage your VPS right from Discord.",
         color=BLURPLE,
     )
     embed.add_field(
         name="Commands",
         value=(
-            f"`{config.PREFIX}help` — show this message\n"
-            f"`{config.PREFIX}deploy` — create a new VPS\n"
-            f"`{config.PREFIX}manage [name]` — open the VPS control panel\n"
-            f"`{config.PREFIX}status` — check ping and server load"
+            f"{E_HELP} `{config.PREFIX}help` — show this message\n"
+            f"{E_VPS} `{config.PREFIX}deploy` — create a new VPS\n"
+            f"{E_GEAR} `{config.PREFIX}manage [name]` — open the VPS control panel\n"
+            f"{E_WORLD} `{config.PREFIX}status` — check ping and server load"
         ),
         inline=False,
     )
@@ -419,7 +503,7 @@ async def deploy(ctx):
         return
 
     embed = discord.Embed(
-        title="🚀 VPS Deployment",
+        title=f"{E_VPS} VPS Deployment",
         description=(
             "Choose the operating system for your new VPS:\n\n"
             f"**Spec:** {config.DEFAULT_RAM} RAM / {config.DEFAULT_CPU} CPU / {config.DEFAULT_DISK} Disk"
@@ -436,33 +520,49 @@ async def manage(ctx, name: str = None):
         await ctx.send("🚫 You are banned from using this bot.")
         return
 
-    if is_admin(ctx.author.id):
-        containers = vm.list_containers()
-    else:
-        containers = vm.list_containers_for_owner(ctx.author.id)
-
-    if not containers:
-        await ctx.send(f"No VPS found. Deploy one first with `{config.PREFIX}deploy`.")
-        return
+    admin = is_admin(ctx.author.id)
+    # A panel always belongs to ONE owner: your own VPS list never contains
+    # machines you issued or transferred to somebody else.
+    own = vm.list_containers_for_owner(ctx.author.id)
 
     if name is None:
-        if len(containers) == 1:
-            name = containers[0]
-        else:
-            lines = "\n".join(f"• `{c}`" for c in containers)
+        if not own:
+            hint = (
+                f"\n{E_GEAR} Админ: `{config.PREFIX}manage <имя>` или `{config.PREFIX}vpslist` для чужих VPS."
+                if admin
+                else ""
+            )
             await ctx.send(
-                f"Your VPS:\n{lines}\n\n"
-                f"Specify one: `{config.PREFIX}manage <name>`"
+                f"{E_VPS} У вас нет VPS. Создайте его: `{config.PREFIX}deploy`." + hint
+            )
+            return
+        if len(own) == 1:
+            name = own[0]
+        else:
+            lines = "\n".join(f"• `{c}`" for c in own)
+            await ctx.send(
+                f"{E_GEAR} Ваши VPS ({len(own)}):\n{lines}\n\n"
+                f"Выберите один: `{config.PREFIX}manage <имя>`"
             )
             return
 
-    if name not in containers:
-        await ctx.send(f"VPS `{name}` not found (or it's not yours).")
-        return
+    if name not in own:
+        # Admins may open somebody else's panel explicitly, by exact name.
+        if not (admin and vm.exists(name)):
+            await ctx.send(f"❌ VPS `{name}` не найден или принадлежит другому пользователю.")
+            return
 
-    number = containers.index(name) + 1
+    owner_id = vm.owner_of(name)
+    number = vps_number(name)
     embed = await build_manage_embed(name, number)
-    await ctx.send(embed=embed, view=ManageView(name, number, admin=is_admin(ctx.author.id)))
+    if admin and owner_id != str(ctx.author.id):
+        embed.set_footer(
+            text=f"Админ-режим • владелец: {owner_id or 'unknown'}"
+        )
+    await ctx.send(
+        embed=embed,
+        view=ManageView(name, number, admin=admin, owner_id=owner_id),
+    )
 
 
 @bot.command(name="status", aliases=["ping"])
@@ -489,7 +589,7 @@ async def status(ctx):
             health = "🟢 Healthy"
 
         embed = discord.Embed(
-            title="📡 Server Status",
+            title=f"{E_WORLD} Server Status",
             description=f"Node: `{config.NODE_NAME}`",
             color=color,
         )
@@ -636,8 +736,13 @@ class AdminView(discord.ui.View):
         if not containers:
             await interaction.followup.send("No VPS found.", ephemeral=True)
             return
-        lines = "\n".join(f"• `{c}`" for c in containers)
-        await interaction.followup.send(f"**All VPS ({len(containers)}):**\n{lines}", ephemeral=True)
+        lines = "\n".join(
+            f"• `{c}` — <@{vm.owner_of(c)}>" if vm.owner_of(c) else f"• `{c}`"
+            for c in containers
+        )
+        await interaction.followup.send(
+            f"{E_VPS} **All VPS ({len(containers)}):**\n{lines}", ephemeral=True
+        )
 
 
 @bot.command(name="admin")
@@ -729,8 +834,11 @@ async def vpslist_cmd(ctx):
     if not containers:
         await ctx.send("No VPS found.")
         return
-    lines = "\n".join(f"• `{c}`" for c in containers)
-    await ctx.send(f"**All VPS ({len(containers)}):**\n{lines}")
+    lines = "\n".join(
+        f"• `{c}` — <@{vm.owner_of(c)}>" if vm.owner_of(c) else f"• `{c}`"
+        for c in containers
+    )
+    await ctx.send(f"{E_VPS} **All VPS ({len(containers)}):**\n{lines}")
 
 
 if __name__ == "__main__":
