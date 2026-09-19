@@ -46,6 +46,17 @@ def list_containers() -> list[str]:
         return []
 
 
+def list_containers_for_owner(owner_id) -> list[str]:
+    try:
+        return [
+            c.name
+            for c in _vps(all_=True)
+            if str((c.labels or {}).get("cloudy.owner")) == str(owner_id)
+        ]
+    except Exception:
+        return []
+
+
 def exists(name: str) -> bool:
     try:
         client().containers.get(name)

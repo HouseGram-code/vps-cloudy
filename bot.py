@@ -359,7 +359,11 @@ async def manage(ctx, name: str = None):
     if store.is_banned(ctx.author.id):
         await ctx.send("🚫 You are banned from using this bot.")
         return
-    containers = vm.list_containers()
+
+    if is_admin(ctx.author.id):
+        containers = vm.list_containers()
+    else:
+        containers = vm.list_containers_for_owner(ctx.author.id)
 
     if not containers:
         await ctx.send(f"No VPS found. Deploy one first with `{config.PREFIX}deploy`.")
@@ -371,13 +375,13 @@ async def manage(ctx, name: str = None):
         else:
             lines = "\n".join(f"• `{c}`" for c in containers)
             await ctx.send(
-                f"You have {len(containers)} VPS:\n{lines}\n\n"
+                f"Your VPS:\n{lines}\n\n"
                 f"Specify one: `{config.PREFIX}manage <name>`"
             )
             return
 
     if name not in containers:
-        await ctx.send(f"VPS `{name}` not found.")
+        await ctx.send(f"VPS `{name}` not found (or it's not yours).")
         return
 
     number = containers.index(name) + 1
