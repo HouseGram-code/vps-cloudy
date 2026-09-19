@@ -54,11 +54,11 @@ _VPS_SUFFIX_RE = re.compile(r"-vps-(\d+)$")
 # --------------------------------------------------------------------------- #
 # Single instance guard
 # --------------------------------------------------------------------------- #
-# Every reply was showing up twice because two copies of the bot were logged in
-# with the same token (e.g. an old `python bot.py` next to the docker-compose
-# container). Discord happily delivers each event to both sessions. We now take
-# an exclusive lock at startup so the second copy refuses to run, and we also
-# ignore a message id we have already handled inside this process.
+# Every reply used to show up twice because two copies of the bot were logged
+# in with the same token (e.g. an old `python bot.py` next to the
+# docker-compose container). Discord delivers each event to both sessions, so
+# we take an exclusive lock at startup and also ignore message ids we already
+# handled in this process.
 
 LOCK_PATH = os.getenv("BOT_LOCK_FILE", "/tmp/cloudy-vps-bot.lock")
 _lock_handle = None
@@ -76,7 +76,7 @@ def acquire_single_instance_lock() -> bool:
         _lock_handle.flush()
         atexit.register(_release_lock)
         return True
-    except ImportError:  # non-POSIX — skip the lock
+    except ImportError:  # non-POSIX platform — skip the lock
         return True
     except OSError:
         return False
@@ -275,16 +275,16 @@ class ManageView(discord.ui.View):
         if uid == self.owner_id or is_admin(interaction.user.id):
             return True
         await interaction.response.send_message(
-            "⛔ Это не ваш VPS.", ephemeral=True
+            "⛔ This VPS does not belong to you.", ephemeral=True
         )
         return False
 
     async def _transfer_callback(self, interaction: discord.Interaction):
         view = TransferConfirmView(self.name, interaction.message)
         await interaction.response.send_message(
-            f"⚠️ Передать VPS `{self.name}` другому пользователю?\n"
-            "Контейнер будет пересоздан под новым владельцем — данные сохранятся, "
-            "имя и владелец поменяются.",
+            f"⚠️ Transfer VPS `{self.name}` to another user?\n"
+            "The container is recreated under the new owner — data is kept, "
+            "the name and the owner change.",
             view=view,
             ephemeral=True,
         )
@@ -327,17 +327,17 @@ class ManageView(discord.ui.View):
             view = discord.ui.View()
             view.add_item(discord.ui.Button(label="Open Console", url=link))
             await interaction.followup.send(
-                f"{E_CHAIN} Консоль SSHX готова: {link}\n"
-                "**Никому не передавайте эту ссылку** — "
-                "у любого, кто её откроет, будет полный доступ к VPS.",
+                f"{E_CHAIN} Your SSHX console is ready: {link}\n"
+                "**Never share this link** — anyone who opens it gets full "
+                "control of your VPS.",
                 view=view,
                 ephemeral=True,
             )
         else:
             await interaction.followup.send(
-                f"⚠️ Не удалось запустить SSHX.\n```{err[:900]}```\n"
-                "Нажмите «Перезапустить консоль» ниже или "
-                "проверьте, что VPS запущен и у него есть интернет.",
+                f"⚠️ Could not start SSHX.\n```{err[:900]}```\n"
+                "Press “Restart console” below, or make sure the VPS is running "
+                "and has internet access.",
                 view=ConsoleRetryView(self.name),
                 ephemeral=True,
             )
@@ -358,7 +358,7 @@ class ConsoleRetryView(discord.ui.View):
         self.name = name
 
     @discord.ui.button(
-        label="Перезапустить консоль",
+        label="Restart console",
         emoji="🔁",
         style=discord.ButtonStyle.blurple,
     )
@@ -369,13 +369,13 @@ class ConsoleRetryView(discord.ui.View):
             view = discord.ui.View()
             view.add_item(discord.ui.Button(label="Open Console", url=link))
             await interaction.followup.send(
-                f"{E_CHAIN} Новая сессия SSHX: {link}\n**Не делитесь ссылкой.**",
+                f"{E_CHAIN} New SSHX session: {link}\n**Never share this link.**",
                 view=view,
                 ephemeral=True,
             )
         else:
             await interaction.followup.send(
-                f"❌ Снова не вышло.\n```{err[:900]}```",
+                f"❌ Still failing.\n```{err[:900]}```",
                 ephemeral=True,
             )
 
@@ -415,22 +415,22 @@ class TransferConfirmView(discord.ui.View):
         self.name = name
         self.manage_message = manage_message
 
-    @discord.ui.button(label="Да, передать", emoji="🔁", style=discord.ButtonStyle.blurple)
+    @discord.ui.button(label="Yes, transfer", emoji="🔁", style=discord.ButtonStyle.blurple)
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(TransferModal(self.name, self.manage_message))
 
-    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            await interaction.response.edit_message(content="Отменено.", view=None)
+            await interaction.response.edit_message(content="Cancelled.", view=None)
         except Exception:
             pass
         self.stop()
 
 
-class TransferModal(discord.ui.Modal, title="Передать VPS"):
+class TransferModal(discord.ui.Modal, title="Transfer VPS"):
     user_id = discord.ui.TextInput(
-        label="ID нового владельца",
+        label="New owner ID",
         placeholder="Discord user ID",
         required=True,
     )
@@ -445,25 +445,36 @@ class TransferModal(discord.ui.Modal, title="Передать VPS"):
         try:
             uid = int(self.user_id.value.strip())
         except ValueError:
-            await interaction.followup.send("❌ Неверный ID пользователя.", ephemeral=True)
+            await interaction.followup.send("❌ Invalid user ID.", ephemeral=True)
+            return
+
+        target = await resolve_user(uid)
+        if target is None:
+            await interaction.followup.send(
+                f"❌ No Discord account with ID `{uid}`. Copy the real user ID "
+                "(Developer Mode → right click → Copy User ID).",
+                ephemeral=True,
+            )
             return
 
         ok, result = await asyncio.to_thread(vm.transfer, self.name, uid)
         if ok:
             try:
                 await self.manage_message.edit(
-                    content=f"🔁 VPS `{self.name}` передан → `{result}` (владелец: `{uid}`).",
+                    content=f"🔁 VPS `{self.name}` → `{result}` (owner: {target.mention}).",
                     embed=None,
                     view=None,
                 )
             except Exception:
                 pass
+            delivered = await deliver_vps(target, result, issued_by=interaction.user)
             await interaction.followup.send(
-                f"✅ VPS передан. Новое имя: `{result}` (владелец: `{uid}`).",
+                f"✅ VPS transferred to {target.mention} (`{uid}`). New name: `{result}`.\n"
+                + delivery_note(target, delivered),
                 ephemeral=True,
             )
         else:
-            await interaction.followup.send(f"❌ Ошибка передачи: {result[:1000]}", ephemeral=True)
+            await interaction.followup.send(f"❌ Transfer failed: {result[:1000]}", ephemeral=True)
 
 
 async def run_deploy(msg: discord.Message, name: str, os_image: str, user: discord.User):
@@ -639,12 +650,14 @@ async def manage(ctx, name: str = None):
     if name is None:
         if not own:
             hint = (
-                f"\n{E_GEAR} Админ: `{config.PREFIX}manage <имя>` или `{config.PREFIX}vpslist` для чужих VPS."
+                f"\n{E_GEAR} Admin: use `{config.PREFIX}manage <name>` or "
+                f"`{config.PREFIX}vpslist` to open someone else's VPS."
                 if admin
                 else ""
             )
             await ctx.send(
-                f"{E_VPS} У вас нет VPS. Создайте его: `{config.PREFIX}deploy`." + hint
+                f"{E_VPS} You have no VPS yet. Create one with `{config.PREFIX}deploy`."
+                + hint
             )
             return
         if len(own) == 1:
@@ -652,24 +665,22 @@ async def manage(ctx, name: str = None):
         else:
             lines = "\n".join(f"• `{c}`" for c in own)
             await ctx.send(
-                f"{E_GEAR} Ваши VPS ({len(own)}):\n{lines}\n\n"
-                f"Выберите один: `{config.PREFIX}manage <имя>`"
+                f"{E_GEAR} Your VPS ({len(own)}):\n{lines}\n\n"
+                f"Pick one: `{config.PREFIX}manage <name>`"
             )
             return
 
     if name not in own:
         # Admins may open somebody else's panel explicitly, by exact name.
         if not (admin and vm.exists(name)):
-            await ctx.send(f"❌ VPS `{name}` не найден или принадлежит другому пользователю.")
+            await ctx.send(f"❌ VPS `{name}` not found, or it belongs to another user.")
             return
 
     owner_id = vm.owner_of(name)
     number = vps_number(name)
     embed = await build_manage_embed(name, number)
     if admin and owner_id != str(ctx.author.id):
-        embed.set_footer(
-            text=f"Админ-режим • владелец: {owner_id or 'unknown'}"
-        )
+        embed.set_footer(text=f"Admin mode • owner: {owner_id or 'unknown'}")
     await ctx.send(
         embed=embed,
         view=ManageView(name, number, admin=admin, owner_id=owner_id),
@@ -754,6 +765,64 @@ def get_host_load():
 # --------------------------------------------------------------------------- #
 # Admin panel
 # --------------------------------------------------------------------------- #
+async def resolve_user(user_id) -> "discord.User | None":
+    """Return the Discord user for this id, or None if the id is not real."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    user = bot.get_user(uid)
+    if user is not None:
+        return user
+    try:
+        return await bot.fetch_user(uid)
+    except discord.NotFound:
+        return None
+    except discord.HTTPException as e:
+        log.warning("fetch_user(%s) failed: %s", uid, e)
+        return None
+
+
+async def deliver_vps(user: discord.User, name: str, issued_by=None) -> bool:
+    """DM the new owner their ready-to-use VPS panel.
+
+    The container is already labelled with ``cloudy.owner`` so it shows up in
+    their ``!manage`` immediately; this just makes the hand-off visible.
+    Returns True when the DM went through.
+    """
+    try:
+        number = vps_number(name)
+        embed = await build_manage_embed(name, number)
+        embed.title = f"{E_VPS} Your VPS is ready — VPS {number}"
+        who = f" by {issued_by}" if issued_by else ""
+        embed.description = (
+            f"{E_VPS} Container: `{name}`\n"
+            f"Node: `{config.NODE_NAME}`\n"
+            f"Owner: {user.mention}\n\n"
+            f"This VPS was issued to you{who}. "
+            f"Open it any time with `{config.PREFIX}manage`."
+        )
+        await user.send(
+            embed=embed,
+            view=ManageView(name, number, owner_id=user.id),
+        )
+        return True
+    except discord.Forbidden:
+        return False
+    except Exception as e:
+        log.warning("deliver_vps to %s failed: %s", user, e)
+        return False
+
+
+def delivery_note(user: discord.User, delivered: bool) -> str:
+    if delivered:
+        return f"{E_GEAR} Panel sent to {user.mention} in DMs."
+    return (
+        f"{E_GEAR} Could not DM {user.mention} (DMs closed) — the VPS is still "
+        f"theirs and appears in their `{config.PREFIX}manage`."
+    )
+
+
 class IssueVPSModal(discord.ui.Modal, title="Issue VPS"):
     user_id = discord.ui.TextInput(label="User ID", placeholder="Discord user ID", required=True)
     ram = discord.ui.TextInput(label="RAM", default="8g", required=True)
@@ -776,6 +845,21 @@ class IssueVPSModal(discord.ui.Modal, title="Issue VPS"):
         if os_image not in ("ubuntu:22.04", "ubuntu:24.04"):
             os_image = "ubuntu:24.04"
 
+        target = await resolve_user(uid)
+        if target is None:
+            await interaction.followup.send(
+                f"❌ No Discord account with ID `{uid}`. Enable Developer Mode, "
+                "right click the user → Copy User ID, and try again.",
+                ephemeral=True,
+            )
+            return
+        if store.is_banned(uid):
+            await interaction.followup.send(
+                f"🚫 {target.mention} (`{uid}`) is banned. Unban them first.",
+                ephemeral=True,
+            )
+            return
+
         name = generate_name(uid)
         ok, err = await asyncio.to_thread(
             vm.create,
@@ -787,9 +871,11 @@ class IssueVPSModal(discord.ui.Modal, title="Issue VPS"):
             str(uid),
         )
         if ok:
+            delivered = await deliver_vps(target, name, issued_by=interaction.user)
             await interaction.followup.send(
-                f"✅ VPS `{name}` issued to user `{uid}` "
-                f"({self.ram.value} RAM / {cpu_n} CPU / {self.disk.value} Disk).",
+                f"{E_VPS} VPS `{name}` issued to {target.mention} (`{uid}`) — "
+                f"{self.ram.value} RAM / {cpu_n} CPU / {self.disk.value} Disk.\n"
+                + delivery_note(target, delivered),
                 ephemeral=True,
             )
         else:
@@ -890,13 +976,36 @@ async def give_cmd(ctx, user_id: int = None, ram: str = "8g", cpu: int = 1, disk
         return
     if os_img not in ("ubuntu:22.04", "ubuntu:24.04"):
         os_img = "ubuntu:24.04"
+
+    target = await resolve_user(user_id)
+    if target is None:
+        await ctx.send(
+            f"❌ No Discord account with ID `{user_id}`. Enable Developer Mode, "
+            "right click the user → Copy User ID, and try again."
+        )
+        return
+    if store.is_banned(user_id):
+        await ctx.send(f"🚫 {target.mention} (`{user_id}`) is banned. Unban them first.")
+        return
+
+    existing = await asyncio.to_thread(vm.list_containers_for_owner, user_id)
     name = generate_name(user_id)
-    await ctx.send(f"⏳ Creating `{name}` for user `{user_id}`...")
+    await ctx.send(f"⏳ Creating `{name}` for {target.mention}...")
     ok, err = await asyncio.to_thread(vm.create, name, os_img, ram, cpu, disk, str(user_id))
-    if ok:
-        await ctx.send(f"✅ VPS `{name}` issued ({ram} RAM / {cpu} CPU / {disk} Disk).")
-    else:
+    if not ok:
         await ctx.send(f"❌ Failed: {err[:1000]}")
+        return
+
+    delivered = await deliver_vps(target, name, issued_by=ctx.author)
+    note = ""
+    if existing:
+        note = f"\nℹ️ They already had {len(existing)} VPS; this is an extra one."
+    await ctx.send(
+        f"{E_VPS} VPS `{name}` issued to {target.mention} — "
+        f"{ram} RAM / {cpu} CPU / {disk} Disk ({os_img}).\n"
+        + delivery_note(target, delivered)
+        + note
+    )
 
 
 @bot.command(name="transfer")
@@ -910,12 +1019,28 @@ async def transfer_cmd(ctx, name: str = None, new_user_id: int = None):
             f"Example: `{config.PREFIX}transfer tbmen12-1480292372620251169-vps-2 987654321098765432`"
         )
         return
-    await ctx.send(f"⏳ Transferring `{name}` to user `{new_user_id}`...")
+    target = await resolve_user(new_user_id)
+    if target is None:
+        await ctx.send(
+            f"❌ No Discord account with ID `{new_user_id}`. "
+            "Copy the real user ID and try again."
+        )
+        return
+    if not await asyncio.to_thread(vm.exists, name):
+        await ctx.send(f"❌ VPS `{name}` not found. Check `{config.PREFIX}vpslist`.")
+        return
+
+    await ctx.send(f"⏳ Transferring `{name}` to {target.mention}...")
     ok, result = await asyncio.to_thread(vm.transfer, name, new_user_id)
-    if ok:
-        await ctx.send(f"✅ VPS transferred. New name: `{result}` (owner: `{new_user_id}`).")
-    else:
+    if not ok:
         await ctx.send(f"❌ Transfer failed: {result[:1000]}")
+        return
+
+    delivered = await deliver_vps(target, result, issued_by=ctx.author)
+    await ctx.send(
+        f"{E_VPS} VPS transferred to {target.mention} — new name: `{result}`.\n"
+        + delivery_note(target, delivered)
+    )
 
 
 @bot.command(name="ban")
