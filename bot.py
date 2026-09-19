@@ -82,6 +82,11 @@ AUTO_KILL_DUPLICATES = os.getenv("AUTO_KILL_DUPLICATES", "1").lower() not in (
     "false",
     "no",
 )
+DUPLICATE_ALERTS = os.getenv("DUPLICATE_ALERTS", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 
 def _other_bot_pids():
@@ -142,22 +147,68 @@ def kill_stale_instances():
 _own_message_ids: "OrderedDict[int, float]" = OrderedDict()
 _last_duplicate_warning = 0.0
 
+
+def _note_own(message_id):
+    """Record a message this process produced."""
+    try:
+        mid = int(message_id)
+    except (TypeError, ValueError):
+        return
+    _own_message_ids[mid] = time.time()
+    while len(_own_message_ids) > 4000:
+        _own_message_ids.popitem(last=False)
+
+
 _orig_send = discord.abc.Messageable.send
 
 
 async def _tracked_send(self, *args, **kwargs):
     msg = await _orig_send(self, *args, **kwargs)
-    try:
-        if msg is not None:
-            _own_message_ids[msg.id] = time.time()
-            while len(_own_message_ids) > 2000:
-                _own_message_ids.popitem(last=False)
-    except Exception:
-        pass
+    if msg is not None:
+        _note_own(getattr(msg, "id", None))
     return msg
 
 
 discord.abc.Messageable.send = _tracked_send
+
+_orig_webhook_send = discord.Webhook.send
+
+
+async def _tracked_webhook_send(self, *args, **kwargs):
+    """Interaction followups go through the webhook API."""
+    msg = await _orig_webhook_send(self, *args, **kwargs)
+    if msg is not None:
+        _note_own(getattr(msg, "id", None))
+    return msg
+
+
+discord.Webhook.send = _tracked_webhook_send
+
+_orig_response_send = discord.InteractionResponse.send_message
+
+
+async def _remember_original_response(interaction):
+    try:
+        msg = await interaction.original_response()
+        _note_own(getattr(msg, "id", None))
+    except Exception:
+        pass
+
+
+async def _tracked_response_send(self, *args, **kwargs):
+    """An initial interaction response also creates a real message."""
+    result = await _orig_response_send(self, *args, **kwargs)
+    if not kwargs.get("ephemeral"):
+        interaction = getattr(self, "_parent", None)
+        if interaction is not None:
+            try:
+                asyncio.create_task(_remember_original_response(interaction))
+            except RuntimeError:
+                pass
+    return result
+
+
+discord.InteractionResponse.send_message = _tracked_response_send
 
 
 
@@ -213,10 +264,28 @@ def _seen_message(message_id: int) -> bool:
 async def _detect_foreign_instance(message: discord.Message):
     """Warn when another process replies with our bot account."""
     global _last_duplicate_warning
+    if not DUPLICATE_ALERTS:
+        return
     if not bot.user or message.author.id != bot.user.id or message.webhook_id:
         return
     if message.id in _own_message_ids:
         return
+    # The gateway event can arrive before our own HTTP call returned the id,
+    # so wait and re-check a few times before accusing anyone. Interaction
+    # responses in particular are confirmed asynchronously.
+    for _ in range(6):
+        await asyncio.sleep(1)
+        if message.id in _own_message_ids:
+            return
+    # Startup grace period: messages sent by our previous process (or before
+    # this one was ready) are not evidence of a second live instance.
+    if time.time() - STARTED_AT < 30:
+        return
+    if _other_bot_pids():
+        # A local stale copy is a different (already reported) problem.
+        log.error(
+            "Another bot process is running on this host: %s", _other_bot_pids()
+        )
     log.error(
         "Duplicate instance detected: message %s was posted by this bot "
         "account but not by this process (build %s, pid %s).",

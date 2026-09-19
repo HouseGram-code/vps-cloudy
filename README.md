@@ -1,99 +1,76 @@
-# Cloudy VPS Bot
+# Cloudy VPS Discord Bot — v1.0
 
-Discord bot for handing out and managing VPS machines. Each VPS is a **Docker container with resource limits** (RAM / CPU / disk). Written in Python (discord.py + Docker SDK).
+Discord-бот для управления VPS. Каждый VPS — это **Docker-контейнер с лимитами ресурсов** (RAM / CPU / диск). Написан на Python (discord.py + Docker SDK).
 
-## Features
+## Возможности
 
-- `!help` — command list (the footer shows the build hash of the answering process)
-- `!about` — specs and limits
-- `!deploy` — create a new VPS: pick the OS (Ubuntu 22.04 / 24.04) → progress animation → control panel
-- `!manage [name]` — VPS control panel with buttons:
-  - ▶️ Start / ⏹️ Stop / 🔁 Restart
-  - 💻 Console (SSHX) — browser console link; a stopped VPS is started automatically
-  - 🗑️ Delete — with confirmation
-  - 🔁 Transfer (admins) — reassign the VPS to another user
-- `!status` (alias `!ping`) — ping + node load
+- `!help` — список команд
+- `!deploy` — создание новой VPS: выбор ОС (Ubuntu 22.04 / 24.04) → анимация → панель управления
+- `!manage [имя]` — панель управления VPS с кнопками:
+  - ▶️ Start / ⏹️ Stop / 🔄 Restart
+  - 💻 Console (SSHX) — реальная ссылка на консоль
+  - 🗑️ Delete — с подтверждением
+- `!status` (алиас `!ping`) — пинг + нагрузка узла: 🟢 норма / 🟡 высокая нагрузка / 🔴 сбой
 
-### Admin
+## Файлы
 
-- `!admin` — admin panel (issue VPS, list all VPS, ban/unban)
-- `!give <id> <ram> <cpu> <disk> [os]` — issue a VPS; the id is validated and the new owner gets a ready control panel in DM
-- `!transfer <name> <id>` — reassign a VPS (the new owner gets a DM panel)
-- `!ban <id>` / `!unban <id>`
-- `!vpslist` — all VPS with their owners
-- `!instances` — show this process (build, pid, host, uptime) and any other bot processes on the host
+| Файл | Назначение |
+|------|-----------|
+| `bot.py` | основной код бота |
+| `vps_manager.py` | работа с Docker (создание/управление контейнерами) |
+| `config.py` | конфигурация |
+| `.env` | токен и настройки (секрет, в git не попадает) |
+| `.env.example` | шаблон конфига |
+| `Dockerfile` / `docker-compose.yml` | запуск бота в Docker |
 
-A user only sees their own machines in `!manage`; admins can open someone else's panel by passing the exact container name.
+## Настройка
 
-## Files
+1. Создай приложение в [Discord Developer Portal](https://discord.com/developers/applications) → Bot.
+2. Включи **Privileged Gateway Intents → Message Content Intent** (иначе `!` команды не работают).
+3. Вставь токен в `.env` → `DISCORD_TOKEN`.
+4. Пригласи бота: OAuth2 → URL Generator → scopes `bot` → permissions `Send Messages`, `Read Message History`, `Embed Links`, `Use External Emojis`.
 
-| File | Purpose |
-| --- | --- |
-| `bot.py` | main bot code |
-| `vps_manager.py` | Docker work (containers, SSHX) |
-| `config.py` | configuration |
-| `.env` | token and settings (secret) |
-| `.env.example` | config template |
-| `Dockerfile` / `docker-compose.yml` | run the bot in Docker |
+## Запуск
 
-## Setup
-
-1. Create an application in the Discord Developer Portal → Bot.
-2. Enable **Message Content Intent**.
-3. Put the token into `.env` → `DISCORD_TOKEN`.
-4. Invite with scope `bot` and permissions: Send Messages, Read Message History, Embed Links, Use External Emojis.
-
-## Running
+### Вариант 1 — напрямую (проще всего)
 
 ```bash
 pip install -r requirements.txt
 python3 bot.py
 ```
 
-or
+На Ubuntu 24.04 добавь `--break-system-packages` к pip.
+
+### Вариант 2 — Docker
 
 ```bash
 docker compose up -d --build
+docker compose logs -f
 ```
 
-The bot talks to Docker through `/var/run/docker.sock` (mounted in `docker-compose.yml`). The `docker` CLI is **not** required inside the bot container.
+Бот управляет контейнерами через `/var/run/docker.sock` — он уже проброшен в `docker-compose.yml`.
 
-## Only one instance at a time (double replies)
+## Требования к хосту
 
-Every answer appearing twice means two processes are logged in with the same token. Three layers now prevent that:
+- Установлен и запущен **Docker** (демон должен отвечать).
+- Для создания VPS нужен доступ к образам `ubuntu:22.04` / `ubuntu:24.04` (Docker Hub).
 
-1. **Auto-kill** — on startup the bot SIGTERMs any other `python … bot.py` process on the same host. Disable with `AUTO_KILL_DUPLICATES=0`.
-2. **Lock file** — an exclusive lock on `/tmp/cloudy-vps-bot.lock` (override with `BOT_LOCK_FILE`); a second copy refuses to start, and each message id is handled only once.
-3. **Remote detection** — if a message is posted by the bot account but not by this process (a copy running on another server), it is logged and the channel gets a one-time warning every 10 minutes with the fix.
+## Лимиты VPS по умолчанию
 
-Use `!instances` to see which build/pid answered and whether another process is running locally.
+Меняются в `.env`:
 
-Clean restart:
-
-```bash
-docker compose down
-pkill -f "python.*bot.py"
-docker compose up -d --build
+```env
+DEFAULT_RAM=1g
+DEFAULT_CPU=1
+DEFAULT_DISK=10g
+LIFETIME_DAYS=30
+NODE_NAME=Local Node
+OWNER_PREFIX=tbmen12
 ```
 
-## Host requirements
+Примечание: RAM и CPU Docker ограничивает жёстко всегда. Лимит диска работает на btrfs/zfs; на обычном ext4 значение сохраняется, но жёстко не режется.
 
-- Docker installed and running.
-- Access to the `ubuntu:22.04` / `ubuntu:24.04` images.
-- Outbound internet from the VPS containers for the SSHX console.
+## ⚠️ Безопасность
 
-## Default VPS limits
-
-| Setting | Default |
-| --- | --- |
-| `DEFAULT_RAM` | `8g` |
-| `DEFAULT_CPU` | `1` |
-| `DEFAULT_DISK` | `10g` |
-| `LIFETIME_DAYS` | `15` |
-
-RAM and CPU are always enforced by Docker; the disk limit needs btrfs/zfs (or overlay2 + pquota).
-
-## ⚠️ Security
-
-- Never publish the token or `.env`. If it leaks, regenerate it.
-- SSHX links give full control over a VPS — never share them.
+- Никогда не публикуй токен бота и `.env`. Если токен засветился — сгенерируй новый.
+- Ссылки на SSHX-консоль дают полный контроль над VPS — никому их не передавай.
