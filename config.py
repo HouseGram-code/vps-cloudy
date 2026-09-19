@@ -17,4 +17,11 @@ NODE_NAME = os.getenv("NODE_NAME", "Local Node")
 OWNER_PREFIX = os.getenv("OWNER_PREFIX", "tbmen12")
 
 # How many days a new VPS lives before it expires
-LIFETIME_DAYS = int(os.getenv("LIFETIME_DAYS", "30"))
+LIFETIME_DAYS = int(os.getenv("LIFETIME_DAYS", "15"))
+
+# Discord user IDs allowed to use admin commands (comma-separated)
+ADMIN_IDS = [
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "1264586393594630239").split(",")
+    if x.strip().isdigit()
+]

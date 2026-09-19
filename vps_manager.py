@@ -234,6 +234,14 @@ def owner_has_vps(owner_id) -> bool:
     return False
 
 
+def get_ip(name: str) -> str:
+    """Return the container's primary IPv4 (host networking = node's IP)."""
+    code, out, _ = run(f"docker exec {name} hostname -I")
+    if code == 0 and out:
+        return out.split()[0]
+    return "—"
+
+
 def _extract_sshx_link(text: str) -> str:
     m = re.search(r"https://sshx\.io/[^\s\x1b]+", text)
     return m.group(0) if m else ""
