@@ -8,10 +8,14 @@ Commands:
 """
 
 import asyncio
+import atexit
 import logging
 import os
 import re
+import socket
+import sys
 import time
+from collections import OrderedDict
 
 import discord
 from discord.ext import commands
@@ -45,6 +49,73 @@ E_WORLD = "<a:474377purpleworld:1550845303756685362>"        # !status
 
 # Matches the trailing "-vps-<N>" suffix inside a container name.
 _VPS_SUFFIX_RE = re.compile(r"-vps-(\d+)$")
+
+
+# --------------------------------------------------------------------------- #
+# Single instance guard
+# --------------------------------------------------------------------------- #
+# Every reply was showing up twice because two copies of the bot were logged in
+# with the same token (e.g. an old `python bot.py` next to the docker-compose
+# container). Discord happily delivers each event to both sessions. We now take
+# an exclusive lock at startup so the second copy refuses to run, and we also
+# ignore a message id we have already handled inside this process.
+
+LOCK_PATH = os.getenv("BOT_LOCK_FILE", "/tmp/cloudy-vps-bot.lock")
+_lock_handle = None
+
+
+def acquire_single_instance_lock() -> bool:
+    """Return True if this process is the only bot instance."""
+    global _lock_handle
+    try:
+        import fcntl
+
+        _lock_handle = open(LOCK_PATH, "w")
+        fcntl.flock(_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_handle.write(f"{os.getpid()}@{socket.gethostname()}\n")
+        _lock_handle.flush()
+        atexit.register(_release_lock)
+        return True
+    except ImportError:  # non-POSIX — skip the lock
+        return True
+    except OSError:
+        return False
+
+
+def _release_lock():
+    global _lock_handle
+    try:
+        if _lock_handle:
+            _lock_handle.close()
+            _lock_handle = None
+            os.unlink(LOCK_PATH)
+    except OSError:
+        pass
+
+
+_handled_messages: "OrderedDict[int, float]" = OrderedDict()
+
+
+def _seen_message(message_id: int) -> bool:
+    """True if this message id was already dispatched (duplicate delivery)."""
+    now = time.time()
+    for mid, ts in list(_handled_messages.items()):
+        if now - ts > 300:
+            _handled_messages.pop(mid, None)
+        else:
+            break
+    if message_id in _handled_messages:
+        return True
+    _handled_messages[message_id] = now
+    while len(_handled_messages) > 1000:
+        _handled_messages.popitem(last=False)
+    return False
+
+
+@bot.check
+async def _no_duplicate_commands(ctx) -> bool:
+    """Run each command exactly once per message."""
+    return not _seen_message(ctx.message.id)
 
 
 # --------------------------------------------------------------------------- #
@@ -450,6 +521,12 @@ async def run_deploy(msg: discord.Message, name: str, os_image: str, user: disco
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Cloudy VPS Bot v{config.BOT_VERSION} ready. Prefix: {config.PREFIX}")
+    try:
+        await bot.change_presence(
+            activity=discord.Game(name=f"{config.PREFIX}help • {config.NODE_NAME}")
+        )
+    except Exception:
+        pass
     ok, err = await asyncio.to_thread(vm.docker_ok)
     if ok:
         log.info("Docker daemon reachable — VPS management enabled.")
@@ -470,7 +547,8 @@ async def help_cmd(ctx):
             f"{E_HELP} `{config.PREFIX}help` — show this message\n"
             f"{E_VPS} `{config.PREFIX}deploy` — create a new VPS\n"
             f"{E_GEAR} `{config.PREFIX}manage [name]` — open the VPS control panel\n"
-            f"{E_WORLD} `{config.PREFIX}status` — check ping and server load"
+            f"{E_WORLD} `{config.PREFIX}status` — check ping and server load\n"
+            f"{E_VPS} `{config.PREFIX}about` — specs and limits"
         ),
         inline=False,
     )
@@ -490,6 +568,39 @@ async def help_cmd(ctx):
         inline=False,
     )
     embed.set_footer(text=f"Version {config.BOT_VERSION} • Node: {config.NODE_NAME}")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="about", aliases=["specs"])
+async def about_cmd(ctx):
+    embed = discord.Embed(
+        title=f"{E_VPS} About Cloudy VPS",
+        description=(
+            "Free Ubuntu VPS, right from Discord — no card, no cost.\n"
+            f"Get one with `{config.PREFIX}deploy`."
+        ),
+        color=BLURPLE,
+    )
+    embed.add_field(
+        name="Specs",
+        value=(
+            f"**RAM:** {config.DEFAULT_RAM}\n"
+            f"**CPU:** {config.DEFAULT_CPU} core(s)\n"
+            f"**Disk:** {config.DEFAULT_DISK}\n"
+            "**OS:** Ubuntu 22.04 / 24.04"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Limits",
+        value=(
+            f"**Lifetime:** {config.LIFETIME_DAYS} days\n"
+            "**Per user:** 1 VPS\n"
+            f"**Console:** {E_CHAIN} SSHX (browser terminal)"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"Cloudy VPS Bot v{config.BOT_VERSION} • Node: {config.NODE_NAME}")
     await ctx.send(embed=embed)
 
 
@@ -844,4 +955,13 @@ async def vpslist_cmd(ctx):
 if __name__ == "__main__":
     if not config.TOKEN:
         raise SystemExit("DISCORD_TOKEN is missing. Set it in .env")
+    if not acquire_single_instance_lock():
+        print(
+            f"Another Cloudy VPS Bot instance already holds {LOCK_PATH}.\n"
+            "Running two copies with the same token makes every reply appear "
+            "twice — stop the other one (e.g. `docker compose down` or kill the "
+            "stray `python bot.py`) and start again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     bot.run(config.TOKEN)

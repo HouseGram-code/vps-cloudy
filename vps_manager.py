@@ -95,8 +95,7 @@ def list_containers_for_owner(owner_id) -> list[str]:
     try:
         for c in _vps(all_=True):
             label_owner = str((c.labels or {}).get("cloudy.owner") or "").strip()
-            name_owner = owner_from_name(c.name)
-            owner = label_owner or name_owner
+            owner = label_owner or owner_from_name(c.name)
             if owner == want:
                 out.append(c.name)
     except Exception as e:
