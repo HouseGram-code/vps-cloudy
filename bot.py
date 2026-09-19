@@ -9,6 +9,8 @@ Commands:
 
 import asyncio
 import atexit
+import hashlib
+import signal
 import logging
 import os
 import re
@@ -64,6 +66,101 @@ LOCK_PATH = os.getenv("BOT_LOCK_FILE", "/tmp/cloudy-vps-bot.lock")
 _lock_handle = None
 
 
+def _build_id() -> str:
+    """Short hash of this file, shown in embeds so you can tell builds apart."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()[:7]
+    except OSError:
+        return "unknown"
+
+
+BUILD_ID = _build_id()
+STARTED_AT = time.time()
+AUTO_KILL_DUPLICATES = os.getenv("AUTO_KILL_DUPLICATES", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
+
+def _other_bot_pids():
+    """PIDs of other python processes running this bot on the same host."""
+    me = os.getpid()
+    found = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        if int(pid) == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmd = fh.read().decode("utf-8", "ignore").replace("\x00", " ")
+        except OSError:
+            continue
+        if "python" in cmd and "bot.py" in cmd:
+            found.append(int(pid))
+    return found
+
+
+def kill_stale_instances():
+    """Stop older copies of the bot still running on this host.
+
+    Two sessions on one token make Discord deliver every command twice, so
+    the newest process wins. Disable with AUTO_KILL_DUPLICATES=0.
+    """
+    pids = _other_bot_pids()
+    if not pids:
+        return []
+    if not AUTO_KILL_DUPLICATES:
+        print(f"Other bot processes detected: {pids} (AUTO_KILL_DUPLICATES=0)")
+        return pids
+    killed = []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except OSError:
+            continue
+    if killed:
+        time.sleep(2)
+        for pid in killed:
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        print(f"Stopped older bot process(es): {killed}")
+    return killed
+
+
+# Remember the ids of messages WE sent, so a message posted by our own bot
+# account that we never sent means a second instance is online somewhere else
+# (another host/container that our local checks cannot see).
+_own_message_ids: "OrderedDict[int, float]" = OrderedDict()
+_last_duplicate_warning = 0.0
+
+_orig_send = discord.abc.Messageable.send
+
+
+async def _tracked_send(self, *args, **kwargs):
+    msg = await _orig_send(self, *args, **kwargs)
+    try:
+        if msg is not None:
+            _own_message_ids[msg.id] = time.time()
+            while len(_own_message_ids) > 2000:
+                _own_message_ids.popitem(last=False)
+    except Exception:
+        pass
+    return msg
+
+
+discord.abc.Messageable.send = _tracked_send
+
+
+
 def acquire_single_instance_lock() -> bool:
     """Return True if this process is the only bot instance."""
     global _lock_handle
@@ -110,6 +207,38 @@ def _seen_message(message_id: int) -> bool:
     while len(_handled_messages) > 1000:
         _handled_messages.popitem(last=False)
     return False
+
+
+@bot.listen("on_message")
+async def _detect_foreign_instance(message: discord.Message):
+    """Warn when another process replies with our bot account."""
+    global _last_duplicate_warning
+    if not bot.user or message.author.id != bot.user.id or message.webhook_id:
+        return
+    if message.id in _own_message_ids:
+        return
+    log.error(
+        "Duplicate instance detected: message %s was posted by this bot "
+        "account but not by this process (build %s, pid %s).",
+        message.id,
+        BUILD_ID,
+        os.getpid(),
+    )
+    now = time.time()
+    if now - _last_duplicate_warning < 600:
+        return
+    _last_duplicate_warning = now
+    try:
+        await message.channel.send(
+            "⚠️ **Duplicate bot instance detected.** Another process is "
+            "logged in with the same token, which is why answers appear twice.\n"
+            f"This process: build `{BUILD_ID}`, pid `{os.getpid()}` on "
+            f"`{socket.gethostname()}`.\n"
+            "Fix: stop the other copy — `docker compose down` and "
+            '`pkill -f "python.*bot.py"`, then start one copy again.'
+        )
+    except Exception:
+        pass
 
 
 @bot.check
@@ -451,9 +580,7 @@ class TransferModal(discord.ui.Modal, title="Transfer VPS"):
         target = await resolve_user(uid)
         if target is None:
             await interaction.followup.send(
-                f"❌ No Discord account with ID `{uid}`. Copy the real user ID "
-                "(Developer Mode → right click → Copy User ID).",
-                ephemeral=True,
+                f"❌ No Discord user with ID `{uid}`.", ephemeral=True
             )
             return
 
@@ -467,9 +594,9 @@ class TransferModal(discord.ui.Modal, title="Transfer VPS"):
                 )
             except Exception:
                 pass
-            delivered = await deliver_vps(target, result, issued_by=interaction.user)
+            delivered = await deliver_vps(target, result, issued_by=str(interaction.user))
             await interaction.followup.send(
-                f"✅ VPS transferred to {target.mention} (`{uid}`). New name: `{result}`.\n"
+                f"{E_VPS} VPS transferred. New name: `{result}` — owner {target.mention}.\n"
                 + delivery_note(target, delivered),
                 ephemeral=True,
             )
@@ -531,7 +658,10 @@ async def run_deploy(msg: discord.Message, name: str, os_image: str, user: disco
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"Cloudy VPS Bot v{config.BOT_VERSION} ready. Prefix: {config.PREFIX}")
+    print(
+        f"Cloudy VPS Bot v{config.BOT_VERSION} (build {BUILD_ID}, pid {os.getpid()} "
+        f"on {socket.gethostname()}) ready. Prefix: {config.PREFIX}"
+    )
     try:
         await bot.change_presence(
             activity=discord.Game(name=f"{config.PREFIX}help • {config.NODE_NAME}")
@@ -569,7 +699,8 @@ async def help_cmd(ctx):
             f"`{config.PREFIX}admin` — admin panel\n"
             f"`{config.PREFIX}give <id> <ram> <cpu> <disk>` — issue a VPS\n"
             f"`{config.PREFIX}transfer <name> <id>` — reassign a VPS to another user\n"
-            f"`{config.PREFIX}ban <id>` / `{config.PREFIX}unban <id>` — ban/unban"
+            f"`{config.PREFIX}ban <id>` / `{config.PREFIX}unban <id>` — ban/unban\n"
+            f"`{config.PREFIX}instances` — check for duplicate bot processes"
         ),
         inline=False,
     )
@@ -578,7 +709,9 @@ async def help_cmd(ctx):
         value="Never share your VPS console links or credentials — anyone with them can take over your VPS.",
         inline=False,
     )
-    embed.set_footer(text=f"Version {config.BOT_VERSION} • Node: {config.NODE_NAME}")
+    embed.set_footer(
+        text=f"Version {config.BOT_VERSION} • build {BUILD_ID} • Node: {config.NODE_NAME}"
+    )
     await ctx.send(embed=embed)
 
 
@@ -765,61 +898,41 @@ def get_host_load():
 # --------------------------------------------------------------------------- #
 # Admin panel
 # --------------------------------------------------------------------------- #
-async def resolve_user(user_id) -> "discord.User | None":
-    """Return the Discord user for this id, or None if the id is not real."""
-    try:
-        uid = int(user_id)
-    except (TypeError, ValueError):
-        return None
-    user = bot.get_user(uid)
+async def resolve_user(user_id):
+    """Resolve a Discord user id to a User object (None if it does not exist)."""
+    user = bot.get_user(int(user_id))
     if user is not None:
         return user
     try:
-        return await bot.fetch_user(uid)
+        return await bot.fetch_user(int(user_id))
     except discord.NotFound:
         return None
-    except discord.HTTPException as e:
-        log.warning("fetch_user(%s) failed: %s", uid, e)
+    except discord.HTTPException:
         return None
 
 
 async def deliver_vps(user: discord.User, name: str, issued_by=None) -> bool:
-    """DM the new owner their ready-to-use VPS panel.
-
-    The container is already labelled with ``cloudy.owner`` so it shows up in
-    their ``!manage`` immediately; this just makes the hand-off visible.
-    Returns True when the DM went through.
-    """
+    """DM the owner a ready-to-use control panel for their new VPS."""
     try:
         number = vps_number(name)
         embed = await build_manage_embed(name, number)
         embed.title = f"{E_VPS} Your VPS is ready — VPS {number}"
-        who = f" by {issued_by}" if issued_by else ""
-        embed.description = (
-            f"{E_VPS} Container: `{name}`\n"
-            f"Node: `{config.NODE_NAME}`\n"
-            f"Owner: {user.mention}\n\n"
-            f"This VPS was issued to you{who}. "
-            f"Open it any time with `{config.PREFIX}manage`."
-        )
-        await user.send(
-            embed=embed,
-            view=ManageView(name, number, owner_id=user.id),
-        )
+        if issued_by:
+            embed.set_footer(text=f"Issued by {issued_by}")
+        await user.send(embed=embed, view=ManageView(name, number, owner_id=user.id))
         return True
     except discord.Forbidden:
         return False
-    except Exception as e:
-        log.warning("deliver_vps to %s failed: %s", user, e)
+    except discord.HTTPException:
         return False
 
 
-def delivery_note(user: discord.User, delivered: bool) -> str:
+def delivery_note(user, delivered: bool) -> str:
     if delivered:
-        return f"{E_GEAR} Panel sent to {user.mention} in DMs."
+        return f"📨 Panel sent to {user.mention} in DM."
     return (
-        f"{E_GEAR} Could not DM {user.mention} (DMs closed) — the VPS is still "
-        f"theirs and appears in their `{config.PREFIX}manage`."
+        f"⚠️ Could not DM {user.mention} (DMs closed). "
+        f"They can open it with `{config.PREFIX}manage`."
     )
 
 
@@ -848,15 +961,12 @@ class IssueVPSModal(discord.ui.Modal, title="Issue VPS"):
         target = await resolve_user(uid)
         if target is None:
             await interaction.followup.send(
-                f"❌ No Discord account with ID `{uid}`. Enable Developer Mode, "
-                "right click the user → Copy User ID, and try again.",
-                ephemeral=True,
+                f"❌ No Discord user with ID `{uid}`.", ephemeral=True
             )
             return
         if store.is_banned(uid):
             await interaction.followup.send(
-                f"🚫 {target.mention} (`{uid}`) is banned. Unban them first.",
-                ephemeral=True,
+                f"⛔ {target.mention} is banned.", ephemeral=True
             )
             return
 
@@ -871,10 +981,10 @@ class IssueVPSModal(discord.ui.Modal, title="Issue VPS"):
             str(uid),
         )
         if ok:
-            delivered = await deliver_vps(target, name, issued_by=interaction.user)
+            delivered = await deliver_vps(target, name, issued_by=str(interaction.user))
             await interaction.followup.send(
-                f"{E_VPS} VPS `{name}` issued to {target.mention} (`{uid}`) — "
-                f"{self.ram.value} RAM / {cpu_n} CPU / {self.disk.value} Disk.\n"
+                f"{E_VPS} VPS `{name}` issued to {target.mention} (`{uid}`) "
+                f"— {self.ram.value} RAM / {cpu_n} CPU / {self.disk.value} disk.\n"
                 + delivery_note(target, delivered),
                 ephemeral=True,
             )
@@ -979,32 +1089,25 @@ async def give_cmd(ctx, user_id: int = None, ram: str = "8g", cpu: int = 1, disk
 
     target = await resolve_user(user_id)
     if target is None:
-        await ctx.send(
-            f"❌ No Discord account with ID `{user_id}`. Enable Developer Mode, "
-            "right click the user → Copy User ID, and try again."
-        )
+        await ctx.send(f"❌ No Discord user with ID `{user_id}`.")
         return
     if store.is_banned(user_id):
-        await ctx.send(f"🚫 {target.mention} (`{user_id}`) is banned. Unban them first.")
+        await ctx.send(f"⛔ {target.mention} is banned.")
         return
 
-    existing = await asyncio.to_thread(vm.list_containers_for_owner, user_id)
+    existing = vm.list_containers_for_owner(user_id)
     name = generate_name(user_id)
-    await ctx.send(f"⏳ Creating `{name}` for {target.mention}...")
+    note = f" (already has {len(existing)})" if existing else ""
+    await ctx.send(f"⏳ Creating `{name}` for {target.mention}{note}...")
     ok, err = await asyncio.to_thread(vm.create, name, os_img, ram, cpu, disk, str(user_id))
     if not ok:
         await ctx.send(f"❌ Failed: {err[:1000]}")
         return
 
-    delivered = await deliver_vps(target, name, issued_by=ctx.author)
-    note = ""
-    if existing:
-        note = f"\nℹ️ They already had {len(existing)} VPS; this is an extra one."
+    delivered = await deliver_vps(target, name, issued_by=str(ctx.author))
     await ctx.send(
-        f"{E_VPS} VPS `{name}` issued to {target.mention} — "
-        f"{ram} RAM / {cpu} CPU / {disk} Disk ({os_img}).\n"
-        + delivery_note(target, delivered)
-        + note
+        f"{E_VPS} VPS `{name}` issued to {target.mention} "
+        f"— {ram} RAM / {cpu} CPU / {disk} disk.\n" + delivery_note(target, delivered)
     )
 
 
@@ -1019,15 +1122,12 @@ async def transfer_cmd(ctx, name: str = None, new_user_id: int = None):
             f"Example: `{config.PREFIX}transfer tbmen12-1480292372620251169-vps-2 987654321098765432`"
         )
         return
+    if not vm.exists(name):
+        await ctx.send(f"❌ VPS `{name}` not found.")
+        return
     target = await resolve_user(new_user_id)
     if target is None:
-        await ctx.send(
-            f"❌ No Discord account with ID `{new_user_id}`. "
-            "Copy the real user ID and try again."
-        )
-        return
-    if not await asyncio.to_thread(vm.exists, name):
-        await ctx.send(f"❌ VPS `{name}` not found. Check `{config.PREFIX}vpslist`.")
+        await ctx.send(f"❌ No Discord user with ID `{new_user_id}`.")
         return
 
     await ctx.send(f"⏳ Transferring `{name}` to {target.mention}...")
@@ -1036,11 +1136,40 @@ async def transfer_cmd(ctx, name: str = None, new_user_id: int = None):
         await ctx.send(f"❌ Transfer failed: {result[:1000]}")
         return
 
-    delivered = await deliver_vps(target, result, issued_by=ctx.author)
+    delivered = await deliver_vps(target, result, issued_by=str(ctx.author))
     await ctx.send(
-        f"{E_VPS} VPS transferred to {target.mention} — new name: `{result}`.\n"
+        f"{E_VPS} VPS transferred. New name: `{result}` — owner {target.mention}.\n"
         + delivery_note(target, delivered)
     )
+
+
+@bot.command(name="instances")
+async def instances_cmd(ctx):
+    """Show this process and any other bot processes on the same host."""
+    if not is_admin(ctx.author.id):
+        await ctx.send("⛔ Admins only.")
+        return
+    others = _other_bot_pids()
+    uptime = int(time.time() - STARTED_AT)
+    lines = [
+        f"{E_GEAR} **This instance**",
+        f"• build `{BUILD_ID}` • pid `{os.getpid()}` • host `{socket.gethostname()}`",
+        f"• uptime `{uptime // 3600}h {uptime % 3600 // 60}m` • lock `{LOCK_PATH}`",
+    ]
+    if others:
+        lines.append(
+            f"⚠️ **Other bot processes on this host:** "
+            + ", ".join(f"`{p}`" for p in others)
+            + "\nStop them or answers will appear twice: "
+            '`pkill -f "python.*bot.py"`.'
+        )
+    else:
+        lines.append(
+            "✅ No other bot process on this host. If replies still double, "
+            "the second copy runs elsewhere (another server/container) with the "
+            "same token."
+        )
+    await ctx.send("\n".join(lines))
 
 
 @bot.command(name="ban")
@@ -1080,6 +1209,7 @@ async def vpslist_cmd(ctx):
 if __name__ == "__main__":
     if not config.TOKEN:
         raise SystemExit("DISCORD_TOKEN is missing. Set it in .env")
+    kill_stale_instances()
     if not acquire_single_instance_lock():
         print(
             f"Another Cloudy VPS Bot instance already holds {LOCK_PATH}.\n"

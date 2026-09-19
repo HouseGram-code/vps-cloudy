@@ -124,49 +124,37 @@ def state(name: str) -> str:
         return "UNKNOWN"
 
 
-# Sentinel exit codes returned by _exec when the container cannot run commands.
-EXEC_NOT_RUNNING = 125
-EXEC_NOT_FOUND = 127
+EXEC_NOT_RUNNING = 125  # container exists but is stopped
+EXEC_NOT_FOUND = 127    # container is gone
 
 
 def last_logs(name: str, lines: int = 15) -> str:
-    """Tail of the container log — explains why a VPS exited."""
     try:
-        out = client().containers.get(name).logs(tail=lines)
-        return out.decode("utf-8", "ignore").strip()
+        c = client().containers.get(name)
+        return c.logs(tail=lines).decode("utf-8", "ignore").strip()
     except Exception:
         return ""
 
 
 def ensure_running(name: str, wait: int = 20):
-    """Make sure the container is up before running commands in it.
-
-    A stopped VPS used to produce a burst of 409 "container is not running"
-    errors from every `docker exec`. Now we simply start it and wait.
-    Returns ``(ok, error)``.
-    """
+    """Start the container if it is stopped. Returns (ok, error)."""
     st = state(name)
     if st == "RUNNING":
         return True, ""
     if st == "NOT_FOUND":
-        return False, f"container `{name}` not found"
-
+        return False, f"container `{name}` no longer exists"
     try:
         client().containers.get(name).start()
-    except docker.errors.NotFound:
-        return False, f"container `{name}` not found"
     except docker.errors.APIError as e:
         return False, f"could not start `{name}`: {e}"
-
     for _ in range(wait):
+        time.sleep(1)
         if state(name) == "RUNNING":
             return True, ""
-        time.sleep(1)
-
     tail = last_logs(name)
-    detail = f"\nLast container output:\n{tail[-500:]}" if tail else ""
     return False, (
-        f"container `{name}` keeps exiting right after start.{detail}"
+        f"container `{name}` stops right after start"
+        + (f":\n{tail[-600:]}" if tail else "")
     )
 
 
@@ -195,10 +183,10 @@ def _exec(name: str, cmd, workdir: str = "/", detach: bool = False, timeout_note
         return EXEC_NOT_FOUND, f"container `{name}` no longer exists"
     except docker.errors.APIError as e:
         msg = str(e)
+        # A stopped container is a normal state, not an error worth spamming
+        # the log with (this was the old 409 Conflict warning flood).
         if "is not running" in msg or getattr(e, "status_code", None) == 409:
-            # Expected whenever the VPS is stopped — callers handle it, so do
-            # not spam the log with a stack of 409 warnings.
-            log.debug("_exec(%s, %r): container not running", name, cmd)
+            log.debug("_exec(%s): container is not running", name)
             return EXEC_NOT_RUNNING, f"container `{name}` is not running"
         log.warning("_exec(%s, %r) API error%s: %s", name, cmd, f" [{timeout_note}]" if timeout_note else "", e)
         return 1, msg
@@ -249,11 +237,11 @@ def create(name: str, os_image: str, ram: str, cpu, disk: str, owner: str = ""):
     # Install basic tools + SSHX inside the VPS (best-effort; the console
     # button re-runs the installer later if this did not work at deploy time).
     try:
-        ok, err = ensure_running(name)
-        if not ok:
-            log.warning("sshx preinstall skipped for %s: %s", name, err)
-            return True, ""
-        install_sshx(name)
+        ok_run, run_err = ensure_running(name)
+        if not ok_run:
+            log.warning("skipping sshx preinstall for %s: %s", name, run_err)
+        else:
+            install_sshx(name)
     except Exception as e:  # never fail a deployment because of sshx
         log.warning("sshx preinstall failed for %s: %s", name, e)
     return True, ""
@@ -523,12 +511,6 @@ def _has(name: str, binary: str) -> bool:
     return code == 0
 
 
-def _down(name: str) -> bool:
-    """True when the container cannot execute anything right now."""
-    code, _ = _exec(name, "true")
-    return code in (EXEC_NOT_RUNNING, EXEC_NOT_FOUND)
-
-
 def _install_deps(name: str) -> str:
     """Install curl/tar/ca-certificates with whatever package manager exists."""
     if _has(name, "curl") or _has(name, "wget"):
@@ -555,6 +537,10 @@ def _sshx_tarball_url(name: str) -> str:
     return "https://s3.amazonaws.com/sshx/sshx-" + target + ".tar.gz"
 
 
+def _down(name: str) -> bool:
+    return state(name) != "RUNNING"
+
+
 def install_sshx(name: str) -> str:
     """Make sure the sshx binary exists in the container. Returns "" or an error."""
     ok, err = ensure_running(name)
@@ -562,9 +548,6 @@ def install_sshx(name: str) -> str:
         return err
     if _has(name, "sshx"):
         return ""
-
-    if _down(name):
-        return f"container `{name}` stopped while installing sshx"
 
     errors = []
     dep_err = _install_deps(name)
@@ -636,7 +619,7 @@ def stop_sshx(name: str):
 
 def start_sshx(name: str, restart: bool = False):
     """Ensure SSHX is installed and running. Returns ``(link, error)``."""
-    ok, err = ensure_running(name)
+    ok, err = ensure_running(name)  # a stopped VPS is started automatically
     if not ok:
         return "", err
 
@@ -667,8 +650,8 @@ def start_sshx(name: str, restart: bool = False):
         if code in (EXEC_NOT_RUNNING, EXEC_NOT_FOUND):
             tail = last_logs(name)
             return "", (
-                f"container `{name}` stopped while starting sshx."
-                + (f"\n{tail[-400:]}" if tail else "")
+                f"the VPS stopped while starting the console"
+                + (f":\n{tail[-600:]}" if tail else "")
             )
         if code == 0:
             link = _extract_sshx_link(out)
