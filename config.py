@@ -9,7 +9,7 @@ PREFIX = "!"
 BOT_VERSION = "1.0"
 
 # Default VPS spec (Docker resource limits)
-DEFAULT_RAM = os.getenv("DEFAULT_RAM", "1g")
+DEFAULT_RAM = os.getenv("DEFAULT_RAM", "8g")
 DEFAULT_CPU = int(os.getenv("DEFAULT_CPU", "1"))
 DEFAULT_DISK = os.getenv("DEFAULT_DISK", "10g")
 

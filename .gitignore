@@ -1,5 +1,7 @@
 .env
 data.json
+nvapi-test.html
+nvapi-test.py
 __pycache__/
 *.pyc
 .vscode/

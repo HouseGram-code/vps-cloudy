@@ -465,7 +465,7 @@ def get_host_load():
 # --------------------------------------------------------------------------- #
 class IssueVPSModal(discord.ui.Modal, title="Issue VPS"):
     user_id = discord.ui.TextInput(label="User ID", placeholder="Discord user ID", required=True)
-    ram = discord.ui.TextInput(label="RAM", default="1g", required=True)
+    ram = discord.ui.TextInput(label="RAM", default="8g", required=True)
     cpu = discord.ui.TextInput(label="CPU", default="1", required=True)
     disk = discord.ui.TextInput(label="Disk", default="10g", required=True)
     os_img = discord.ui.TextInput(
@@ -490,7 +490,7 @@ class IssueVPSModal(discord.ui.Modal, title="Issue VPS"):
             vm.create,
             name,
             os_image,
-            self.ram.value.strip() or "1g",
+            self.ram.value.strip() or "8g",
             cpu_n,
             self.disk.value.strip() or "10g",
             str(uid),
@@ -582,7 +582,7 @@ async def admin_cmd(ctx):
 
 
 @bot.command(name="give")
-async def give_cmd(ctx, user_id: int, ram: str = "1g", cpu: int = 1, disk: str = "10g", os_img: str = "ubuntu:24.04"):
+async def give_cmd(ctx, user_id: int, ram: str = "8g", cpu: int = 1, disk: str = "10g", os_img: str = "ubuntu:24.04"):
     if not is_admin(ctx.author.id):
         await ctx.send("⛔ Admins only.")
         return
