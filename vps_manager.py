@@ -11,7 +11,7 @@ import time
 
 import docker
 
-from config import LIFETIME_DAYS
+from config import LIFETIME_DAYS, OWNER_PREFIX
 
 LABEL = "cloudy.vps"  # label that marks our managed VPS containers
 
@@ -153,6 +153,84 @@ def delete(name: str):
         return True, ""
     except docker.errors.APIError as e:
         return False, str(e)
+
+
+def transfer(name: str, new_owner: str):
+    """Reassign a VPS to a new owner.
+
+    Docker cannot edit a container's labels in place, so we snapshot the
+    container to a temporary image, recreate it under the new owner's name
+    with the same spec + a new ``cloudy.owner`` label, then remove the old
+    container. Returns (ok, new_name_or_error).
+    """
+    try:
+        c = client().containers.get(name)
+    except docker.errors.NotFound:
+        return False, f"container `{name}` not found"
+
+    labels = c.labels or {}
+    os_img = labels.get("cloudy.os", "ubuntu:24.04")
+    ram = labels.get("cloudy.ram", "8g")
+    cpu = labels.get("cloudy.cpu", "1")
+    disk = labels.get("cloudy.disk", "10g")
+    expires = labels.get("cloudy.expires", "")
+
+    if owner_has_vps(new_owner):
+        return False, f"user `{new_owner}` already owns a VPS"
+
+    # Keep the -vps-N suffix, swap only the owner id embedded in the name.
+    suffix = name.rsplit("-vps-", 1)[1] if "-vps-" in name else "1"
+    new_name = f"{OWNER_PREFIX}-{new_owner}-vps-{suffix}"
+
+    if exists(new_name):
+        return False, f"target container `{new_name}` already exists"
+
+    repo, tag = "cloudy-transfer-tmp", str(new_owner)
+    try:
+        img = c.commit(repository=repo, tag=tag)
+    except docker.errors.APIError as e:
+        return False, f"snapshot failed: {e}"
+
+    new_labels = {
+        LABEL: "true",
+        "cloudy.os": os_img,
+        "cloudy.ram": ram,
+        "cloudy.cpu": str(cpu),
+        "cloudy.disk": disk,
+        "cloudy.owner": str(new_owner),
+        "cloudy.expires": expires,
+    }
+
+    def _cleanup_img():
+        try:
+            client().images.remove(f"{repo}:{tag}", force=True)
+        except Exception:
+            pass
+
+    try:
+        client().containers.run(
+            image=f"{repo}:{tag}",
+            name=new_name,
+            hostname=new_name,
+            command=["sleep", "infinity"],
+            detach=True,
+            mem_limit=ram,
+            nano_cpus=int(float(cpu) * 1e9),
+            network_mode="host",
+            labels=new_labels,
+        )
+    except docker.errors.APIError as e:
+        _cleanup_img()
+        return False, f"recreate failed: {e}"
+
+    try:
+        c.remove(force=True)
+    except docker.errors.APIError as e:
+        _cleanup_img()
+        return False, f"recreated as `{new_name}` but could not remove old container: {e}"
+
+    _cleanup_img()
+    return True, new_name
 
 
 def get_config(name: str) -> dict:

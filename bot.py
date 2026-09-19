@@ -150,10 +150,28 @@ class OSSelectView(discord.ui.View):
 
 
 class ManageView(discord.ui.View):
-    def __init__(self, name: str, number: int):
+    def __init__(self, name: str, number: int, admin: bool = False):
         super().__init__(timeout=None)
         self.name = name
         self.number = number
+        if admin:
+            btn = discord.ui.Button(
+                label="Transfer",
+                emoji="🔁",
+                style=discord.ButtonStyle.gray,
+            )
+            btn.callback = self._transfer_callback
+            self.add_item(btn)
+
+    async def _transfer_callback(self, interaction: discord.Interaction):
+        view = TransferConfirmView(self.name, interaction.message)
+        await interaction.response.send_message(
+            f"⚠️ Передать VPS `{self.name}` другому пользователю?\n"
+            "Контейнер будет пересоздан под новым владельцем — данные сохранятся, "
+            "имя и владелец поменяются.",
+            view=view,
+            ephemeral=True,
+        )
 
     async def _do(self, interaction: discord.Interaction, action: str):
         await interaction.response.defer()
@@ -241,6 +259,63 @@ class ConfirmDeleteView(discord.ui.View):
         self.stop()
 
 
+class TransferConfirmView(discord.ui.View):
+    def __init__(self, name: str, manage_message: discord.Message):
+        super().__init__(timeout=None)
+        self.name = name
+        self.manage_message = manage_message
+
+    @discord.ui.button(label="Да, передать", emoji="🔁", style=discord.ButtonStyle.blurple)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TransferModal(self.name, self.manage_message))
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.edit_message(content="Отменено.", view=None)
+        except Exception:
+            pass
+        self.stop()
+
+
+class TransferModal(discord.ui.Modal, title="Передать VPS"):
+    user_id = discord.ui.TextInput(
+        label="ID нового владельца",
+        placeholder="Discord user ID",
+        required=True,
+    )
+
+    def __init__(self, name: str, manage_message: discord.Message):
+        super().__init__()
+        self.name = name
+        self.manage_message = manage_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            uid = int(self.user_id.value.strip())
+        except ValueError:
+            await interaction.followup.send("❌ Неверный ID пользователя.", ephemeral=True)
+            return
+
+        ok, result = await asyncio.to_thread(vm.transfer, self.name, uid)
+        if ok:
+            try:
+                await self.manage_message.edit(
+                    content=f"🔁 VPS `{self.name}` передан → `{result}` (владелец: `{uid}`).",
+                    embed=None,
+                    view=None,
+                )
+            except Exception:
+                pass
+            await interaction.followup.send(
+                f"✅ VPS передан. Новое имя: `{result}` (владелец: `{uid}`).",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(f"❌ Ошибка передачи: {result[:1000]}", ephemeral=True)
+
+
 async def run_deploy(msg: discord.Message, name: str, os_image: str, user: discord.User):
     stages = [
         ("Allocating resources", 15),
@@ -320,6 +395,7 @@ async def help_cmd(ctx):
         value=(
             f"`{config.PREFIX}admin` — admin panel\n"
             f"`{config.PREFIX}give <id> <ram> <cpu> <disk>` — issue a VPS\n"
+            f"`{config.PREFIX}transfer <name> <id>` — reassign a VPS to another user\n"
             f"`{config.PREFIX}ban <id>` / `{config.PREFIX}unban <id>` — ban/unban"
         ),
         inline=False,
@@ -386,7 +462,7 @@ async def manage(ctx, name: str = None):
 
     number = containers.index(name) + 1
     embed = await build_manage_embed(name, number)
-    await ctx.send(embed=embed, view=ManageView(name, number))
+    await ctx.send(embed=embed, view=ManageView(name, number, admin=is_admin(ctx.author.id)))
 
 
 @bot.command(name="status", aliases=["ping"])
@@ -605,6 +681,25 @@ async def give_cmd(ctx, user_id: int = None, ram: str = "8g", cpu: int = 1, disk
         await ctx.send(f"✅ VPS `{name}` issued ({ram} RAM / {cpu} CPU / {disk} Disk).")
     else:
         await ctx.send(f"❌ Failed: {err[:1000]}")
+
+
+@bot.command(name="transfer")
+async def transfer_cmd(ctx, name: str = None, new_user_id: int = None):
+    if not is_admin(ctx.author.id):
+        await ctx.send("⛔ Admins only.")
+        return
+    if name is None or new_user_id is None:
+        await ctx.send(
+            f"Usage: `{config.PREFIX}transfer <vps_name> <new_user_id>`\n"
+            f"Example: `{config.PREFIX}transfer tbmen12-1480292372620251169-vps-2 987654321098765432`"
+        )
+        return
+    await ctx.send(f"⏳ Transferring `{name}` to user `{new_user_id}`...")
+    ok, result = await asyncio.to_thread(vm.transfer, name, new_user_id)
+    if ok:
+        await ctx.send(f"✅ VPS transferred. New name: `{result}` (owner: `{new_user_id}`).")
+    else:
+        await ctx.send(f"❌ Transfer failed: {result[:1000]}")
 
 
 @bot.command(name="ban")
