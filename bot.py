@@ -576,15 +576,21 @@ async def admin_cmd(ctx):
             f"**Banned users:** {banned_count}\n\n"
             "Use the buttons below."
         ),
-        color=GOLD,
+        color=YELLOW,
     )
     await ctx.send(embed=embed, view=AdminView())
 
 
 @bot.command(name="give")
-async def give_cmd(ctx, user_id: int, ram: str = "8g", cpu: int = 1, disk: str = "10g", os_img: str = "ubuntu:24.04"):
+async def give_cmd(ctx, user_id: int = None, ram: str = "8g", cpu: int = 1, disk: str = "10g", os_img: str = "ubuntu:24.04"):
     if not is_admin(ctx.author.id):
         await ctx.send("⛔ Admins only.")
+        return
+    if user_id is None:
+        await ctx.send(
+            f"Usage: `{config.PREFIX}give <user_id> <ram> <cpu> <disk> [os]`\n"
+            f"Example: `{config.PREFIX}give 123456789 8g 2 20g ubuntu:24.04`"
+        )
         return
     if os_img not in ("ubuntu:22.04", "ubuntu:24.04"):
         os_img = "ubuntu:24.04"
